@@ -499,9 +499,9 @@ func (rf *Raft) heartbeat(){
 
 //TODO: Try to use context
 func (rf *Raft) doAppendEntry(){
+	rf.mu.Lock()
 	prevIndex, prevTerm := rf.getPrevLogInfo()
 	//resultChan := make(chan *CommonReply, len(rf.peers) -1)
-	rf.mu.Lock()
 	args := make(map[int]*AppendEntryArg, len(rf.peers) -1)
 	for idx, _ := range rf.peers{
 		if idx == rf.me{
@@ -562,7 +562,10 @@ func (rf *Raft) doAppendBottom(serverID int, arg *AppendEntryArg){
 	}
 	if !reply.OK{
 		rf.mu.Lock()
-		rf.nextIndex[serverID]--
+		//TODO: nextIndex can't less than 1
+		if rf.nextIndex[serverID] > 0{
+			rf.nextIndex[serverID]--
+		}
 		rf.mu.Unlock()
 		return
 	}
@@ -654,11 +657,19 @@ func (rf *Raft) leaderCommit(){
 	if oldCommit == rf.commitIndex{
 		return
 	}
+	msgs := make([]ApplyMsg, 0)
 	for i, v := range rf.log{
 		if i > oldCommit && i <= rf.commitIndex{
-			rf.applyCh <- ApplyMsg{Command: v.Cmd, Index: v.Index}
-			rf.logHandle.Printf("leader commit cmd:%v at index:%d on term:%d\n", v.Cmd, v.Index, v.Term)
+			//rf.applyCh <- ApplyMsg{Command: v.Cmd, Index: v.Index}
+			//rf.logHandle.Printf("leader commit cmd:%v at index:%d on term:%d\n", v.Cmd, v.Index, v.Term)
+			msgs = append(msgs, ApplyMsg{Command: v.Cmd, Index: v.Index})
 		}
+	}
+
+	sort.Slice(msgs, func(i, j int) bool{return msgs[i].Index < msgs[j].Index})
+	for _, v := range msgs{
+		rf.applyCh <- v
+		rf.logHandle.Printf("leader commit cmd:%v at index:%d on term:%d\n", v.Command, v.Index, rf.log[v.Index].Term)
 	}
 }
 
