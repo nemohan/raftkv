@@ -20,8 +20,8 @@ package raft
 import "sync"
 import "labrpc"
 
-// import "bytes"
-// import "encoding/gob"
+import "bytes"
+import "encoding/gob"
 import(
 	"time"
 	"fmt"
@@ -127,6 +127,29 @@ func (rf *Raft) persist() {
 	// e.Encode(rf.yyy)
 	// data := w.Bytes()
 	// rf.persister.SaveRaftState(data)
+	/*
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	*/
+	w := new(bytes.Buffer)
+	e := gob.NewEncoder(w)
+	e.Encode(rf.currentTerm)
+	e.Encode(rf.voted)
+	e.Encode(rf.commitIndex)
+	logCopy := make(map[int]*Command, len(rf.log) -1)
+	for i, cmd := range rf.log{
+		if i == 0{
+			continue
+		}
+		logCopy[i] = cmd
+	}
+	e.Encode(logCopy)
+	data := w.Bytes()
+	rf.persister.SaveRaftState(data)
+	rf.logHandle.Printf("save term:%d voted:%v\n", rf.currentTerm, rf.voted)
+	for _, cmd := range logCopy{
+		rf.logHandle.Printf("save cmd:%v\n", *cmd)
+	}
 }
 
 //
@@ -139,6 +162,21 @@ func (rf *Raft) readPersist(data []byte) {
 	// d := gob.NewDecoder(r)
 	// d.Decode(&rf.xxx)
 	// d.Decode(&rf.yyy)
+	r := bytes.NewBuffer(data)
+	d := gob.NewDecoder(r)
+	d.Decode(&rf.currentTerm)
+	d.Decode(&rf.voted)
+	d.Decode(&rf.commitIndex)
+	d.Decode(&rf.log)
+	rf.logHandle.Printf("load term:%d voted:%v\n", rf.currentTerm, rf.voted)
+	index := 0
+	for _, cmd := range rf.log{
+		rf.logHandle.Printf("load cmd:%v\n", *cmd)
+		if cmd.Index > index{
+			index = cmd.Index
+		}
+	}
+	rf.cmdIndex = index+1
 }
 
 
@@ -209,6 +247,7 @@ func (rf *Raft) updateTerm(term int){
 		return
 	}
 	rf.currentTerm = term
+	rf.persist()
 	if rf.state == stateFollower{
 		return
 	}
@@ -256,11 +295,11 @@ func (rf *Raft) AppendEntry(arg AppendEntryArg, reply *AppendEntryReply){
 	rf.logHandle.Printf("me:%d AppendEntryArg:%s entrys:%d\n", rf.me, arg.String(), len(arg.Entries))
 	if arg.Term < rf.currentTerm{
 		reply.Term = rf.currentTerm
-		reply.OK = true	
+		reply.OK = true
 		rf.logHandle.Printf("me:%d reject append entry:%s\n", rf.me, arg.String())
 		return
 	}
-	rf.updateTerm(arg.Term)	
+	rf.updateTerm(arg.Term)
 	rf.electionTimeout = time.Now()
 	rf.voted = false
 	if arg.PrevLogIndex == invalidPrevLogIndex{
@@ -345,11 +384,14 @@ func (rf *Raft) checkLog(arg *AppendEntryArg, reply *AppendEntryReply){
 			rf.commitIndex = max
 		}
 		rf.commit(oldCommit, rf.commitIndex)
-		rf.cmdIndex = rf.commitIndex + 1
+		//rf.cmdIndex = rf.commitIndex + 1
+		rf.cmdIndex = rf.commitIndex +1
+		//rf.cmdIndex++
 		rf.logHandle.Printf("cmd index:%d\n", rf.cmdIndex)
 	}
 	for _, c := range arg.Entries{
 		rf.log[c.Index] = c
+		rf.persist()
 		rf.logHandle.Printf("me:%d add new cmd:%v index:%d term:%d\n", rf.me, c.Cmd, c.Index, c.Term)
 	}
 	reply.OK = true
@@ -705,6 +747,7 @@ func (rf *Raft) leaderCommit(){
 	if oldCommit == rf.commitIndex{
 		return
 	}
+	rf.persist()
 	msgs := make([]ApplyMsg, 0)
 	for i, v := range rf.log{
 		if i > oldCommit && i <= rf.commitIndex{
