@@ -29,6 +29,7 @@ import(
 	"log"
 	"os"
 	"sort"
+	"sync/atomic"
 )
 
 
@@ -93,10 +94,13 @@ type Raft struct {
 	lastApplied int
 }
 
+type Voter struct{
+	counted bool
+	voted bool
+}
 // return currentTerm and whether this server
 // believes it is the leader.
 func (rf *Raft) GetState() (int, bool) {
-
 	var term int
 	var isleader bool
 	// Your code here.
@@ -138,7 +142,10 @@ func (rf *Raft) readPersist(data []byte) {
 }
 
 
-
+var seqSource uint32 = 0
+func getSeq()uint32{
+	return atomic.AddUint32(&seqSource, 1)
+}
 
 //
 // example RequestVote RPC arguments structure.
@@ -149,6 +156,7 @@ type RequestVoteArgs struct {
 	CandidateID int
 	LastLogIndex int
 	LastLogTerm int
+	Seq uint32
 }
 
 //
@@ -159,6 +167,7 @@ type RequestVoteReply struct {
 	Term int
 	VoteGranted bool
 	From int
+	Seq uint32
 }
 
 
@@ -186,11 +195,11 @@ type CommonReply struct{
 }
 
 func (a *AppendEntryArg) String() string{
-	return fmt.Sprintf("Term:%d LeaderID:%d PrevLogIndex:%d PrevLogTerm:%d CommitIndex:%d",
+	return fmt.Sprintf("Term:%d LeaderID:%d PrevLogIndex:%d PrevLogTerm:%d CommitIndex:%d ",
 		a.Term, a.LeaderID, a.PrevLogIndex, a.PrevLogTerm, a.CommitIndex)
 }
 func (r *RequestVoteArgs) String()string{
-	return fmt.Sprintf("Term:%d from:%d LastLogIndex:%d LastLogTerm:%d", r.Term, r.CandidateID, r.LastLogIndex, r.LastLogTerm)
+	return fmt.Sprintf("Term:%d from:%d LastLogIndex:%d LastLogTerm:%d seq:%d", r.Term, r.CandidateID, r.LastLogIndex, r.LastLogTerm, r.Seq)
 }
 //
 // example RequestVote RPC handler.
@@ -244,7 +253,7 @@ func (rf *Raft) RequestVote(args RequestVoteArgs, reply *RequestVoteReply) {
 func (rf *Raft) AppendEntry(arg AppendEntryArg, reply *AppendEntryReply){
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-	rf.logHandle.Printf("me:%d AppendEntryArg:%s\n", rf.me, arg.String())	
+	rf.logHandle.Printf("me:%d AppendEntryArg:%s entrys:%d\n", rf.me, arg.String(), len(arg.Entries))
 	if arg.Term < rf.currentTerm{
 		reply.Term = rf.currentTerm
 		reply.OK = true	
@@ -289,13 +298,18 @@ func (rf *Raft) commit(start, end int){
 	}
 	sort.Slice(msgs, func(i, j int) bool{return msgs[i].Index < msgs[j].Index})
 	for _, m := range msgs{
-		rf.applyCh <- m 
+		rf.applyCh <- m
 		rf.logHandle.Printf("me:%d commit cmd:%v at index:%d on term:%d\n", rf.me, m.Command, m.Index, rf.log[m.Index].Term)
 	}
 	for i, _ := range rf.peers{
 		rf.nextIndex[i] = end +1
 		rf.matchIndex[i] = end
 	}
+	//TODO: update our cmd index
+	/*
+	rf.cmdIndex = end + 1
+	rf.logHandle.Printf("cmdIndex:%d end:%d\n", rf.cmdIndex, end)
+	*/
 }
 
 func (rf *Raft) checkLog(arg *AppendEntryArg, reply *AppendEntryReply){
@@ -331,7 +345,8 @@ func (rf *Raft) checkLog(arg *AppendEntryArg, reply *AppendEntryReply){
 			rf.commitIndex = max
 		}
 		rf.commit(oldCommit, rf.commitIndex)
-		rf.cmdIndex = rf.commitIndex
+		rf.cmdIndex = rf.commitIndex + 1
+		rf.logHandle.Printf("cmd index:%d\n", rf.cmdIndex)
 	}
 	for _, c := range arg.Entries{
 		rf.log[c.Index] = c
@@ -406,23 +421,32 @@ func (rf *Raft) startVote(){
 
 func (rf *Raft) prepareVote(arg *RequestVoteArgs){
 	majority := len(rf.peers) / 2 + 1
-	reply := &RequestVoteReply{}
+	arg.Seq = getSeq()
+	//reply := &RequestVoteReply{}
 	resultChan := make(chan *RequestVoteReply, len(rf.peers) -1)
 	rf.broadcast(func(id int){
+		reply := &RequestVoteReply{}
 		if ok := rf.sendRequestVote(id, *arg, reply); !ok{
-			rf.logHandle.Printf("me:%d Failed request vote on id:%d arg:%s\n", rf.me, id, arg.String())
+			rf.logHandle.Printf("me:%d Failed request vote on id:%d arg:%s seq:%d\n", rf.me, id, arg.String(), arg.Seq)
 		}
 		reply.From = id
+		reply.Seq = arg.Seq
 		resultChan <-reply})
 	num := 1
 	resultNum := 0
+	//voter := make(map[int]bool)
+	voter := make(map[int]*Voter)
 	for {
 
 		r := <-resultChan
 		if r.VoteGranted{
-			num++
+			_, ok := voter[r.From]
+			if !ok{
+				voter[r.From] = &Voter{counted:false, voted: true}
+			}
+			//num++
 		}
-		rf.logHandle.Printf("me:%d vote reply:%v from :%d\n", rf.me, r, r.From)
+		rf.logHandle.Printf("me:%d vote reply:%v from :%d seq:%d\n", rf.me, r, r.From, r.Seq)
 		//our term out of date, so revert to follower
 		rf.mu.Lock()
 		if r.Term > rf.currentTerm{
@@ -431,8 +455,15 @@ func (rf *Raft) prepareVote(arg *RequestVoteArgs){
 			return
 		}
 		rf.mu.Unlock()
+		for _, v := range voter{
+			if v.voted && !v.counted{
+				num++
+				v.counted = true
+			}
+		}
 		resultNum++
 		if resultNum >= majority || num >= majority{
+			rf.logHandle.Printf("majority:%d voters:%v\n", majority, voter)
 			break
 		}
 	}
@@ -468,10 +499,14 @@ func(rf *Raft) getLastLogInfo()(int, int){
 	return prevIndex, rf.log[prevIndex].Term
 }
 
-func (rf *Raft) getPrevLogInfo()(int, int){
+//TODO: is this prevIndex correct
+func (rf *Raft) getPrevLogInfo(isNew bool)(int, int){
 	prevIndex := rf.getLastLogID()
 	prevTerm := -1
-	prevIndex--
+	rf.logHandle.Printf(" new:%v cmd index:%d prevIndex:%d\n", isNew, rf.cmdIndex, prevIndex)
+	if isNew{
+		prevIndex--
+	}
 	v, ok := rf.log[prevIndex]
 	if ok{
 		prevTerm = v.Term
@@ -494,13 +529,13 @@ func (rf *Raft) heartbeat(){
 	rf.lastHeartbeat = now
 	rf.mu.Unlock()
 	rf.logHandle.Printf("heartbeat\n")
-	rf.doAppendEntry()
+	rf.doAppendEntry(false)
 }
 
 //TODO: Try to use context
-func (rf *Raft) doAppendEntry(){
+func (rf *Raft) doAppendEntry(isNew bool){
 	rf.mu.Lock()
-	prevIndex, prevTerm := rf.getPrevLogInfo()
+	prevIndex, prevTerm := rf.getPrevLogInfo(isNew)
 	//resultChan := make(chan *CommonReply, len(rf.peers) -1)
 	args := make(map[int]*AppendEntryArg, len(rf.peers) -1)
 	for idx, _ := range rf.peers{
@@ -524,10 +559,20 @@ func (rf *Raft) doAppendEntry(){
 			rf.logHandle.Printf("add entry:%v, nextIdx:%d to node:%d\n", c, nextIdx, idx)
 			arg.Entries = append(arg.Entries, c)
 		}//end for
+
 		//TODO: let the crashed node cache up
+		//TODO: case 2: leader start many commands before followr receive
+		//so arg.PrevLogIndex = nextIdx -1
 		if nextIdx < prevIndex{
-			arg.PrevLogIndex = nextIdx
-			arg.PrevLogTerm = rf.log[nextIdx].Term
+			arg.PrevLogIndex = nextIdx -1
+			cmd, ok := rf.log[nextIdx -1]
+			term := -1
+			if ok{
+				term = cmd.Term
+			}
+			//arg.PrevLogTerm = rf.log[nextIdx -1].Term
+			arg.PrevLogTerm = term
+			rf.logHandle.Printf("prev index:%d prev term:%d\n", arg.PrevLogIndex, arg.PrevLogTerm)
 		}
 		/*
 		reply := &AppendEntryReply{}
@@ -542,6 +587,9 @@ func (rf *Raft) doAppendEntry(){
 		}(idx)
 		*/
 		args[idx] = &arg
+	}
+	if isNew{
+		rf.lastHeartbeat = time.Now()
 	}
 	rf.mu.Unlock()
 	//rf.handleResult(resultChan)
@@ -733,7 +781,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	rf.logHandle.Printf("****************me:%d start cmd:%v on index:%d at term:%d\n", rf.me, command, index, term)
 	rf.cmdIndex++
 	rf.matchIndex[rf.me] = index
-	go rf.doAppendEntry()
+	go rf.doAppendEntry(true)
 	return index, term, isLeader
 }
 
