@@ -137,19 +137,25 @@ func (rf *Raft) persist() {
 	e.Encode(rf.voted)
 	e.Encode(rf.commitIndex)
 	logCopy := make(map[int]*Command, len(rf.log) -1)
+	indexs := make([]int, 0)
 	for i, cmd := range rf.log{
 		if i == 0{
 			continue
 		}
 		logCopy[i] = cmd
+		indexs = append(indexs, i)
 	}
 	e.Encode(logCopy)
 	data := w.Bytes()
 	rf.persister.SaveRaftState(data)
 	rf.logHandle.Printf("save term:%d voted:%v\n", rf.currentTerm, rf.voted)
+	/*
 	for _, cmd := range logCopy{
-		rf.logHandle.Printf("save cmd:%v\n", *cmd)
+		//rf.logHandle.Printf("save cmd:%v\n", *cmd)
 	}
+	*/
+	sort.Slice(indexs, func(i, j int)bool{ return indexs[i] < indexs[j]})
+	rf.logHandle.Printf("save:%v\n", indexs)
 }
 
 //
@@ -170,12 +176,16 @@ func (rf *Raft) readPersist(data []byte) {
 	d.Decode(&rf.log)
 	rf.logHandle.Printf("load term:%d voted:%v\n", rf.currentTerm, rf.voted)
 	index := 0
-	for _, cmd := range rf.log{
-		rf.logHandle.Printf("load cmd:%v\n", *cmd)
+	indexs := make([]int,0) 
+	for i, cmd := range rf.log{
+		//rf.logHandle.Printf("load cmd:%v\n", *cmd)
 		if cmd.Index > index{
 			index = cmd.Index
 		}
+		indexs = append(indexs, i)
 	}
+	sort.Slice(indexs, func(i, j int)bool{return indexs[i] < indexs[j]})
+	rf.logHandle.Printf("load cmd:%v\n", indexs)
 	rf.cmdIndex = index+1
 }
 
@@ -216,6 +226,7 @@ type AppendEntryArg struct{
 	PrevLogTerm int
 	Entries []*Command
 	CommitIndex int
+	Seq uint32
 }
 
 type AppendEntryReply struct{
@@ -233,8 +244,8 @@ type CommonReply struct{
 }
 
 func (a *AppendEntryArg) String() string{
-	return fmt.Sprintf("Term:%d LeaderID:%d PrevLogIndex:%d PrevLogTerm:%d CommitIndex:%d ",
-		a.Term, a.LeaderID, a.PrevLogIndex, a.PrevLogTerm, a.CommitIndex)
+	return fmt.Sprintf("Term:%d LeaderID:%d PrevLogIndex:%d PrevLogTerm:%d CommitIndex:%d seq:%d",
+		a.Term, a.LeaderID, a.PrevLogIndex, a.PrevLogTerm, a.CommitIndex, a.Seq)
 }
 func (r *RequestVoteArgs) String()string{
 	return fmt.Sprintf("Term:%d from:%d LastLogIndex:%d LastLogTerm:%d seq:%d", r.Term, r.CandidateID, r.LastLogIndex, r.LastLogTerm, r.Seq)
@@ -293,9 +304,14 @@ func (rf *Raft) AppendEntry(arg AppendEntryArg, reply *AppendEntryReply){
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 	rf.logHandle.Printf("me:%d AppendEntryArg:%s entrys:%d\n", rf.me, arg.String(), len(arg.Entries))
+	/*
+	for _, e := range arg.Entries{
+		rf.logHandle.Printf("entry:%v\n", *e)
+	}
+	*/
 	if arg.Term < rf.currentTerm{
 		reply.Term = rf.currentTerm
-		reply.OK = true
+		reply.OK = false
 		rf.logHandle.Printf("me:%d reject append entry:%s\n", rf.me, arg.String())
 		return
 	}
@@ -309,10 +325,20 @@ func (rf *Raft) AppendEntry(arg AppendEntryArg, reply *AppendEntryReply){
 	rf.checkLog(&arg, reply)
 }
 
+//TODO: this code is buggy
+/*
 func (rf *Raft) deleteLogAfter(idx int){
 	for idx, c := range rf.log{
 		if idx >= c.Index{
 			delete(rf.log, idx)
+		}
+	}
+}
+*/
+func (rf *Raft) deleteLogAfter(idx int){
+	for _, c := range rf.log{
+		if c.Index >= idx{
+			delete(rf.log, c.Index)
 		}
 	}
 }
@@ -338,11 +364,12 @@ func (rf *Raft) commit(start, end int){
 	sort.Slice(msgs, func(i, j int) bool{return msgs[i].Index < msgs[j].Index})
 	for _, m := range msgs{
 		rf.applyCh <- m
-		rf.logHandle.Printf("me:%d commit cmd:%v at index:%d on term:%d\n", rf.me, m.Command, m.Index, rf.log[m.Index].Term)
+		rf.logHandle.Printf("me:%d commit cmd:%v at index:%d on term:%d s:%d e:%d\n", rf.me, m.Command, m.Index, rf.log[m.Index].Term, start, end)
 	}
 	for i, _ := range rf.peers{
 		rf.nextIndex[i] = end +1
 		rf.matchIndex[i] = end
+		rf.logHandle.Printf("peer:%d matchIndex:%d\n", i, end)
 	}
 	//TODO: update our cmd index
 	/*
@@ -376,7 +403,14 @@ func (rf *Raft) checkLog(arg *AppendEntryArg, reply *AppendEntryReply){
 		}
 	}
 
+	for _, c := range arg.Entries{
+		rf.log[c.Index] = c
+		rf.persist()
+		rf.logHandle.Printf("me:%d add new cmd:%v index:%d term:%d\n", rf.me, c.Cmd, c.Index, c.Term)
+	}
 	max := rf.getMaxIndex()
+	rf.cmdIndex = max+1
+	//max := rf.getMaxIndex()
 	if arg.CommitIndex > rf.commitIndex{
 		oldCommit := rf.commitIndex
 		rf.commitIndex = arg.CommitIndex
@@ -385,15 +419,22 @@ func (rf *Raft) checkLog(arg *AppendEntryArg, reply *AppendEntryReply){
 		}
 		rf.commit(oldCommit, rf.commitIndex)
 		//rf.cmdIndex = rf.commitIndex + 1
+		/*
 		rf.cmdIndex = rf.commitIndex +1
-		//rf.cmdIndex++
+		rf.cmdIndex++
+		*/
 		rf.logHandle.Printf("cmd index:%d\n", rf.cmdIndex)
 	}
+	//TODO: let this happen before commit
+	/*
 	for _, c := range arg.Entries{
 		rf.log[c.Index] = c
 		rf.persist()
 		rf.logHandle.Printf("me:%d add new cmd:%v index:%d term:%d\n", rf.me, c.Cmd, c.Index, c.Term)
 	}
+	max = rf.getMaxIndex()
+	rf.cmdIndex = max+1
+	*/
 	reply.OK = true
 }
 //
@@ -578,7 +619,6 @@ func (rf *Raft) heartbeat(){
 func (rf *Raft) doAppendEntry(isNew bool){
 	rf.mu.Lock()
 	prevIndex, prevTerm := rf.getPrevLogInfo(isNew)
-	//resultChan := make(chan *CommonReply, len(rf.peers) -1)
 	args := make(map[int]*AppendEntryArg, len(rf.peers) -1)
 	for idx, _ := range rf.peers{
 		if idx == rf.me{
@@ -598,7 +638,7 @@ func (rf *Raft) doAppendEntry(isNew bool){
 			if i < nextIdx{
 				continue 
 			}
-			rf.logHandle.Printf("add entry:%v, nextIdx:%d to node:%d\n", c, nextIdx, idx)
+			//rf.logHandle.Printf("add entry:%v, nextIdx:%d to node:%d\n", c, nextIdx, idx)
 			arg.Entries = append(arg.Entries, c)
 		}//end for
 
@@ -635,16 +675,19 @@ func (rf *Raft) doAppendEntry(isNew bool){
 	}
 	rf.mu.Unlock()
 	//rf.handleResult(resultChan)
+	seq := getSeq()
 	for i, arg := range args{
-		go rf.doAppendBottom(i, arg)
+		arg.Seq = seq
+		go rf.doAppendBottom(i, arg, seq)
 	}
 }
 
-func (rf *Raft) doAppendBottom(serverID int, arg *AppendEntryArg){
+func (rf *Raft) doAppendBottom(serverID int, arg *AppendEntryArg, seq uint32){
 	reply := &AppendEntryReply{}
 	ok := rf.sendAppendEntry(serverID, *arg, reply)
+	//TODO: Failed to send and failed to reply
 	if !ok{
-		rf.logHandle.Printf("failed to append entry to :%d\n", serverID)
+		rf.logHandle.Printf("failed to append entry to :%d seq:%d \n", serverID, seq)
 		return
 	}
 	if !rf.isLeader(reply.Term) || len(arg.Entries) == 0{
@@ -671,6 +714,7 @@ func (rf *Raft) doAppendBottom(serverID int, arg *AppendEntryArg){
 			matchIdx = i
 		}
 	}
+	rf.logHandle.Printf("matchIndex:%d seq:%d\n", matchIdx, seq)
 	rf.nextIndex[serverID] = nextIdx + 1
 	rf.matchIndex[serverID] = matchIdx
 	rf.mu.Unlock()
@@ -747,6 +791,11 @@ func (rf *Raft) leaderCommit(){
 	if oldCommit == rf.commitIndex{
 		return
 	}
+	/*
+	if rf.cmdIndex <= rf.commitIndex{
+		rf.cmdIndex = rf.commitIndex+1
+	}
+	*/
 	rf.persist()
 	msgs := make([]ApplyMsg, 0)
 	for i, v := range rf.log{
@@ -760,7 +809,7 @@ func (rf *Raft) leaderCommit(){
 	sort.Slice(msgs, func(i, j int) bool{return msgs[i].Index < msgs[j].Index})
 	for _, v := range msgs{
 		rf.applyCh <- v
-		rf.logHandle.Printf("leader commit cmd:%v at index:%d on term:%d\n", v.Command, v.Index, rf.log[v.Index].Term)
+		rf.logHandle.Printf("leader commit cmd:%v at index:%d on term:%d s:%d e:%d\n", v.Command, v.Index, rf.log[v.Index].Term, oldCommit, rf.commitIndex)
 	}
 }
 
@@ -819,11 +868,12 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	}
 	index = rf.cmdIndex
 	term = rf.currentTerm
-	cmd := &Command{Index:index,Cmd:command, Term: term} 
-	rf.log[index] = cmd 
+	cmd := &Command{Index:index,Cmd:command, Term: term}
+	rf.log[index] = cmd
 	rf.logHandle.Printf("****************me:%d start cmd:%v on index:%d at term:%d\n", rf.me, command, index, term)
 	rf.cmdIndex++
 	rf.matchIndex[rf.me] = index
+	rf.persist()
 	go rf.doAppendEntry(true)
 	return index, term, isLeader
 }
