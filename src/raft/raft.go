@@ -118,7 +118,7 @@ func (rf *Raft) GetState() (int, bool) {
 // where it can later be retrieved after a crash and restart.
 // see paper's Figure 2 for a description of what should be persistent.
 //
-func (rf *Raft) persist(saveLog bool) {
+func (rf *Raft) persist() {
 	// Your code here.
 	// Example:
 	// w := new(bytes.Buffer)
@@ -137,8 +137,7 @@ func (rf *Raft) persist(saveLog bool) {
 	e.Encode(rf.voted)
 	e.Encode(rf.commitIndex)
 	indexs := make([]int, 0)
-	if saveLog{
-		logCopy := make(map[int]*Command, len(rf.log) -1)
+	logCopy := make(map[int]*Command, len(rf.log) -1)
 		for i, cmd := range rf.log{
 			if i == 0{
 				continue
@@ -147,7 +146,6 @@ func (rf *Raft) persist(saveLog bool) {
 			indexs = append(indexs, i)
 		}
 		e.Encode(logCopy)
-	}
 	data := w.Bytes()
 	rf.persister.SaveRaftState(data)
 	rf.logHandle.Printf("save term:%d voted:%v\n", rf.currentTerm, rf.voted)
@@ -260,7 +258,7 @@ func (rf *Raft) updateTerm(term int){
 		return
 	}
 	rf.currentTerm = term
-	rf.persist(false)
+	rf.persist()
 	if rf.state == stateFollower{
 		return
 	}
@@ -388,12 +386,18 @@ func (rf *Raft) checkLog(arg *AppendEntryArg, reply *AppendEntryReply){
 		rf.logHandle.Printf("me:%d hasn't log at index:%d seq:%d\n", rf.me, arg.PrevLogIndex, arg.Seq)
 		reply.OK = false
 		reply.LastCommitIndex = rf.commitIndex
+		if reply.LastCommitIndex == 0{
+			reply.LastCommitIndex = 1
+		}
 		return
 	}
 	if c.Term != arg.PrevLogTerm{
 		rf.logHandle.Printf("me:%d term doesn't match at index:%d my term:%d leader:%d\n", rf.me, arg.PrevLogIndex, c.Term, arg.PrevLogTerm)
 		reply.OK = false
 		reply.LastCommitIndex = rf.commitIndex
+		if reply.LastCommitIndex == 0{
+			reply.LastCommitIndex = 1
+		}
 		return
 	}
 	//TODO: Entries's number greater than one when we crashed and reboot
@@ -407,7 +411,7 @@ func (rf *Raft) checkLog(arg *AppendEntryArg, reply *AppendEntryReply){
 
 	for _, c := range arg.Entries{
 		rf.log[c.Index] = c
-		rf.persist(true)
+		rf.persist()
 		rf.logHandle.Printf("me:%d add new cmd:%v index:%d term:%d\n", rf.me, c.Cmd, c.Index, c.Term)
 	}
 	max := rf.getMaxIndex()
@@ -688,8 +692,12 @@ func (rf *Raft) doAppendBottom(serverID int, arg *AppendEntryArg, seq uint32){
 		rf.mu.Lock()
 		//TODO: nextIndex can't less than 1
 		if rf.nextIndex[serverID] > 0{
-			rf.nextIndex[serverID]--
+			//rf.nextIndex[serverID]--
+			if reply.LastCommitIndex != 0{
+				rf.nextIndex[serverID] = reply.LastCommitIndex
+			}
 			rf.logHandle.Printf("update nextIndex:%d seq:%d node:%d\n", rf.nextIndex[serverID], seq, serverID)
+
 		}
 		rf.mu.Unlock()
 		return
@@ -748,7 +756,7 @@ func (rf *Raft) leaderCommit(){
 	}
 	/*
 	*/
-	rf.persist(true)
+	rf.persist()
 	msgs := make([]ApplyMsg, 0)
 	for i, v := range rf.log{
 		if i > oldCommit && i <= rf.commitIndex{
@@ -823,7 +831,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	rf.logHandle.Printf("****************me:%d start cmd:%v on index:%d at term:%d\n", rf.me, command, index, term)
 	rf.cmdIndex++
 	rf.matchIndex[rf.me] = index
-	rf.persist(true)
+	rf.persist()
 	go rf.doAppendEntry(true)
 	return index, term, isLeader
 }
