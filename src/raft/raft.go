@@ -118,7 +118,7 @@ func (rf *Raft) GetState() (int, bool) {
 // where it can later be retrieved after a crash and restart.
 // see paper's Figure 2 for a description of what should be persistent.
 //
-func (rf *Raft) persist() {
+func (rf *Raft) persist(saveLog bool) {
 	// Your code here.
 	// Example:
 	// w := new(bytes.Buffer)
@@ -136,16 +136,18 @@ func (rf *Raft) persist() {
 	e.Encode(rf.currentTerm)
 	e.Encode(rf.voted)
 	e.Encode(rf.commitIndex)
-	logCopy := make(map[int]*Command, len(rf.log) -1)
 	indexs := make([]int, 0)
-	for i, cmd := range rf.log{
-		if i == 0{
-			continue
+	if saveLog{
+		logCopy := make(map[int]*Command, len(rf.log) -1)
+		for i, cmd := range rf.log{
+			if i == 0{
+				continue
+			}
+			logCopy[i] = cmd
+			indexs = append(indexs, i)
 		}
-		logCopy[i] = cmd
-		indexs = append(indexs, i)
+		e.Encode(logCopy)
 	}
-	e.Encode(logCopy)
 	data := w.Bytes()
 	rf.persister.SaveRaftState(data)
 	rf.logHandle.Printf("save term:%d voted:%v\n", rf.currentTerm, rf.voted)
@@ -258,7 +260,7 @@ func (rf *Raft) updateTerm(term int){
 		return
 	}
 	rf.currentTerm = term
-	rf.persist()
+	rf.persist(false)
 	if rf.state == stateFollower{
 		return
 	}
@@ -383,7 +385,7 @@ func (rf *Raft) checkLog(arg *AppendEntryArg, reply *AppendEntryReply){
 	//TODO: this situation will happen when crashed and reboot
 	c, ok := rf.log[arg.PrevLogIndex]
 	if !ok{
-		rf.logHandle.Printf("me:%d hasn't log at index:%d\n", rf.me, arg.PrevLogIndex)
+		rf.logHandle.Printf("me:%d hasn't log at index:%d seq:%d\n", rf.me, arg.PrevLogIndex, arg.Seq)
 		reply.OK = false
 		reply.LastCommitIndex = rf.commitIndex
 		return
@@ -405,7 +407,7 @@ func (rf *Raft) checkLog(arg *AppendEntryArg, reply *AppendEntryReply){
 
 	for _, c := range arg.Entries{
 		rf.log[c.Index] = c
-		rf.persist()
+		rf.persist(true)
 		rf.logHandle.Printf("me:%d add new cmd:%v index:%d term:%d\n", rf.me, c.Cmd, c.Index, c.Term)
 	}
 	max := rf.getMaxIndex()
@@ -654,19 +656,9 @@ func (rf *Raft) doAppendEntry(isNew bool){
 			}
 			//arg.PrevLogTerm = rf.log[nextIdx -1].Term
 			arg.PrevLogTerm = term
-			rf.logHandle.Printf("prev index:%d prev term:%d\n", arg.PrevLogIndex, arg.PrevLogTerm)
+			rf.logHandle.Printf("prev index:%d prev term:%d node:%d\n", arg.PrevLogIndex, arg.PrevLogTerm,idx)
 		}
 		/*
-		reply := &AppendEntryReply{}
-		go func(serverID int){
-			ok := rf.sendAppendEntry(serverID, arg, reply)
-			r := &CommonReply{ok: ok, 
-				from:serverID, 
-				reply:reply,
-				arg: &arg,
-				}
-			resultChan <- r
-		}(idx)
 		*/
 		args[idx] = &arg
 	}
@@ -674,7 +666,6 @@ func (rf *Raft) doAppendEntry(isNew bool){
 		rf.lastHeartbeat = time.Now()
 	}
 	rf.mu.Unlock()
-	//rf.handleResult(resultChan)
 	seq := getSeq()
 	for i, arg := range args{
 		arg.Seq = seq
@@ -698,6 +689,7 @@ func (rf *Raft) doAppendBottom(serverID int, arg *AppendEntryArg, seq uint32){
 		//TODO: nextIndex can't less than 1
 		if rf.nextIndex[serverID] > 0{
 			rf.nextIndex[serverID]--
+			rf.logHandle.Printf("update nextIndex:%d seq:%d node:%d\n", rf.nextIndex[serverID], seq, serverID)
 		}
 		rf.mu.Unlock()
 		return
@@ -705,17 +697,25 @@ func (rf *Raft) doAppendBottom(serverID int, arg *AppendEntryArg, seq uint32){
 	rf.mu.Lock()
 	nextIdx  := rf.nextIndex[serverID]
 	matchIdx  := rf.matchIndex[serverID]
+	//TODO: if we don't use oldNext, there is bug
+	//bug description: the next idx is 4 when we sent [1, 2, 3] successfully,
+	//Then we send [1, 2, 3] again, the next idx will add one
+	//oldNext := nextIdx
+	incrNext := false
 	for _, v := range arg.Entries{
 		i := v.Index
-		if i > nextIdx {
+		if i >= nextIdx {
 			nextIdx = i
+			incrNext = true
 		}
 		if i > matchIdx{
 			matchIdx = i
 		}
 	}
-	rf.logHandle.Printf("matchIndex:%d seq:%d\n", matchIdx, seq)
-	rf.nextIndex[serverID] = nextIdx + 1
+	rf.logHandle.Printf("matchIndex:%d nextIdx:%d seq:%d node:%d\n", matchIdx, nextIdx, seq, serverID)
+	if incrNext{
+		rf.nextIndex[serverID] = nextIdx + 1
+	}
 	rf.matchIndex[serverID] = matchIdx
 	rf.mu.Unlock()
 	rf.leaderCommit()
@@ -723,52 +723,6 @@ func (rf *Raft) doAppendBottom(serverID int, arg *AppendEntryArg, seq uint32){
 
 //TODO: The slower node may affect us
 func (rf *Raft) handleResult(resultChan <-chan *CommonReply){
-	num := 0
-	max := len(rf.peers) -1
-	nextIdx := 0
-	matchIdx := 0
-	for c := range resultChan{
-		//Failed to send request
-		num++
-		from := c.from
-		reply := c.reply
-		arg := c.arg
-		if !c.ok{
-			rf.logHandle.Printf("failed to append entry to :%d\n", c.from)
-			goto next
-		}
-		if !rf.isLeader(reply.Term){
-			return
-		}
-		if !reply.OK{
-			rf.mu.Lock()
-			rf.nextIndex[from]--
-			rf.mu.Unlock()
-			goto next
-		}
-		if len(arg.Entries) == 0{
-			goto next
-		}
-		nextIdx  = rf.nextIndex[from]
-		matchIdx  = rf.matchIndex[from]
-		for _, v := range arg.Entries{
-			i := v.Index
-			if i > nextIdx {
-				nextIdx = i
-			}
-			if i > matchIdx{
-				matchIdx = i
-			}
-		}
-		rf.nextIndex[from] = nextIdx + 1
-		rf.matchIndex[from] = matchIdx
-		next:
-		if num == max{
-			break
-		}
-	}
-
-	rf.leaderCommit()
 }
 
 func (rf *Raft) leaderCommit(){
@@ -779,6 +733,7 @@ func (rf *Raft) leaderCommit(){
 	for{
 		passedNum := 0
 		for _, i := range rf.matchIndex{
+			//if i > rf.commitIndex && rf.log[i].Term == rf.currentTerm{
 			if i > rf.commitIndex{
 				passedNum++
 			}
@@ -792,16 +747,11 @@ func (rf *Raft) leaderCommit(){
 		return
 	}
 	/*
-	if rf.cmdIndex <= rf.commitIndex{
-		rf.cmdIndex = rf.commitIndex+1
-	}
 	*/
-	rf.persist()
+	rf.persist(true)
 	msgs := make([]ApplyMsg, 0)
 	for i, v := range rf.log{
 		if i > oldCommit && i <= rf.commitIndex{
-			//rf.applyCh <- ApplyMsg{Command: v.Cmd, Index: v.Index}
-			//rf.logHandle.Printf("leader commit cmd:%v at index:%d on term:%d\n", v.Cmd, v.Index, v.Term)
 			msgs = append(msgs, ApplyMsg{Command: v.Cmd, Index: v.Index})
 		}
 	}
@@ -873,7 +823,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	rf.logHandle.Printf("****************me:%d start cmd:%v on index:%d at term:%d\n", rf.me, command, index, term)
 	rf.cmdIndex++
 	rf.matchIndex[rf.me] = index
-	rf.persist()
+	rf.persist(true)
 	go rf.doAppendEntry(true)
 	return index, term, isLeader
 }
