@@ -155,7 +155,7 @@ func (rf *Raft) persist() {
 	}
 	*/
 	sort.Slice(indexs, func(i, j int)bool{ return indexs[i] < indexs[j]})
-	rf.logHandle.Printf("save:%v\n", indexs)
+	//rf.logHandle.Printf("save:%v\n", indexs)
 }
 
 //
@@ -185,7 +185,7 @@ func (rf *Raft) readPersist(data []byte) {
 		indexs = append(indexs, i)
 	}
 	sort.Slice(indexs, func(i, j int)bool{return indexs[i] < indexs[j]})
-	rf.logHandle.Printf("load cmd:%v\n", indexs)
+	//rf.logHandle.Printf("load cmd:%v\n", indexs)
 	rf.cmdIndex = index+1
 }
 
