@@ -3,14 +3,17 @@ package raftkv
 import "labrpc"
 import "crypto/rand"
 import "math/big"
-//import "sync/atomic"
+import "sync/atomic"
+import "time"
 //import "sync"
 
+import "fmt"
 type Clerk struct {
 	servers []*labrpc.ClientEnd
 	// You will have to modify this struct.
 	leader int
 	seq    int
+	id     uint32
 }
 
 func nrand() int64 {
@@ -23,11 +26,16 @@ func nrand() int64 {
 func MakeClerk(servers []*labrpc.ClientEnd) *Clerk {
 	ck := new(Clerk)
 	ck.servers = servers
+	ck.id = getID()
 	// You'll have to add code here.
 	ck.leader = -1
 	return ck
 }
 
+var clientID uint32
+func getID()uint32{
+	return atomic.AddUint32(&clientID, 1)
+}
 //
 // fetch the current value for a key.
 // returns "" if the key does not exist.
@@ -45,24 +53,40 @@ func (ck *Clerk) Get(key string) string {
 	value := ""
 	seq := ck.seq
 	ck.seq++
-	arg := &GetArgs{Key : key, Seq : seq}
+	num := 0
+	retry:
+	arg := &GetArgs{Key : key, Seq : seq, From: int(ck.id)}
 	reply := &GetReply{}
 	if ck.leader != -1{
 		ok := ck.servers[ck.leader].Call("RaftKV.Get", arg, reply)
-		if !ok || reply.WrongLeader{
+		if reply.WrongLeader{
+			fmt.Printf("c:%d get key failed:%s from leader change:%d\n", ck.id, key, ck.leader)
 			goto next
 		}
+		if !ok {
+			fmt.Printf("c:%d get key failed:%s from leader:%d\n", ck.id, key, ck.leader)
+			if num < 2{
+				time.Sleep(time.Millisecond * 50)
+				goto retry
+			}
+			goto next
+		}
+		fmt.Printf("c:%d get key:%s :%v leader index:%d\n", ck.id, key, reply, ck.leader)
 		return reply.Value
 	}
 	next:
 	for i, c := range ck.servers{
+		reply := &GetReply{}
 		ok := c.Call("RaftKV.Get", arg, reply)
 		if !ok || reply.WrongLeader{
+			fmt.Printf("c:%d get key:%s client reply:%v to:%d from:%d failed rpc:%v\n", ck.id, key, reply, i, reply.From, ok)
 			continue
 		}
 		ck.leader = i
+		fmt.Printf("c:%d get key:%s 1:%v leader index:%d from:%d\n", ck.id, key, reply, i, reply.From)
 		return reply.Value
 	}
+	fmt.Printf("c:%d get nothing key:%s\n", ck.id, key)
 	return value
 }
 
@@ -80,11 +104,21 @@ func (ck *Clerk) PutAppend(key string, value string, op string) {
 	// You will have to modify this function.
 	seq := ck.seq
 	ck.seq++
-	arg := &PutAppendArgs{Key: key, Value: value, Op: op, Seq:seq}
+	num := 0
+	retry:
+	arg := &PutAppendArgs{Key: key, Value: value, Op: op, Seq:seq, From:int(ck.id)}
+	fmt.Printf("c:%d client put:%s\n", ck.id, arg.String())
 	reply := &PutAppendReply{}
 	if ck.leader != -1{
 		ok := ck.servers[ck.leader].Call("RaftKV.PutAppend", arg, reply)
-		if !ok || reply.WrongLeader{
+		if !ok{
+			if num < 3{
+				time.Sleep(time.Millisecond * 50)
+				num++
+				goto retry
+			}
+		}
+		if !reply.WrongLeader{
 			goto next
 		}
 		if reply.Err == OK{
@@ -93,6 +127,7 @@ func (ck *Clerk) PutAppend(key string, value string, op string) {
 	}
 	next:
 	for i, c := range ck.servers{
+		reply := &PutAppendReply{}
 		ok := c.Call("RaftKV.PutAppend", arg, reply)
 		if !ok || reply.WrongLeader{
 			continue
@@ -106,6 +141,7 @@ func (ck *Clerk) PutAppend(key string, value string, op string) {
 func (ck *Clerk) Put(key string, value string) {
 	ck.PutAppend(key, value, "Put")
 }
+
 func (ck *Clerk) Append(key string, value string) {
 	ck.PutAppend(key, value, "Append")
 }

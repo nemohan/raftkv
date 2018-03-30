@@ -42,6 +42,7 @@ type Result struct{
 	Value string
 	Err string
 }
+
 type CMD struct{
 	resultChan chan *Result 
 }
@@ -61,6 +62,7 @@ type RaftKV struct {
 	clientID map[int]int
 	log *log.Logger
 	cmdCh chan *CMD
+	lastResult map[int]*GetReply
 }
 
 func (kv *RaftKV) Log(format string, arg ...interface{}){
@@ -78,11 +80,25 @@ func (kv *RaftKV) Get(args *GetArgs, reply *GetReply) {
 	kv.mu.Lock()
 	max, ok := kv.clientID[from]
 	//TODO: how to handle the return value properly
-	if ok && args.Seq <= max{
+	if ok && args.Seq < max{
 		kv.mu.Unlock()
+		kv.Log("invalid seq for key:%s seq:%d max:%d\n", args.Key, args.Seq, max)
+		return
+	}
+	if ok && args.Seq == max{
+		oldReply, ok := kv.lastResult[args.From]
+		if !ok{
+			kv.mu.Unlock()
+			kv.Log("miss for key:%s arg: from:%d seq:%d\n", args.Key, args.From, args.Seq)
+			return
+		}
+		*reply = *oldReply 
+		kv.mu.Unlock()
+		kv.Log("last hit for key:%s reply:%v\n", args.Key, reply)
 		return
 	}
 	kv.mu.Unlock()
+	key := args.Key
 	 op := Op{
 		Key : args.Key,
 		ID: args.Seq,
@@ -92,14 +108,18 @@ func (kv *RaftKV) Get(args *GetArgs, reply *GetReply) {
 	_, _, isLeader := kv.rf.Start(op)
 	if !isLeader{
 		reply.WrongLeader = true
+		reply.Seq = args.Seq
+		reply.From = kv.me
 		return
 	}
 	resultChan := kv.addPending(&op)
 	result := <-resultChan
 	reply.Value= result.Value
-	reply.From = op.From
+	//reply.From = op.From
+	reply.From = kv.me
 	reply.Seq = args.Seq
 	reply.Err = OK
+	kv.Log("get result:%s key:%s reply:%v\n", reply.Value, key, reply)
 }
 
 
@@ -129,7 +149,7 @@ func (kv *RaftKV) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	if !isLeader{
 		if num < 3{
 			num++
-			time.Sleep(time.Millisecond * 500)
+			time.Sleep(time.Millisecond * 200 )
 			goto retry
 		}
 		reply.WrongLeader = true
@@ -147,6 +167,7 @@ func (kv *RaftKV) addPending(op *Op) chan *Result{
 	defer kv.mu.Unlock()
 	from := op.From
 	kv.clientID[from] = op.ID
+	kv.Log("seq id:%d from:%d\n", op.ID, from)
 	pending, ok := kv.pending[from]
 	if !ok{
 		pending = &PendingOp{ ops: make(map[int]*Op), notifyCh: make(map[int]chan *Result)}
@@ -171,7 +192,8 @@ func (kv *RaftKV) removePending(op *Op) chan *Result{
 	}
 	ch, ok := pending.notifyCh[op.ID]
 	if !ok{
-		kv.doPanic(op.String())
+		//kv.doPanic(op.String())
+		return nil
 	}
 	delete(pending.notifyCh, op.ID)
 	delete(pending.ops, op.ID)
@@ -207,11 +229,14 @@ func (kv *RaftKV) poll(){
 					kv.Log("put: arg:%s\n", op.String())
 					result.Err = OK
 				case "Append":
-					_, ok := kv.commited[op.Key]
+					old, ok := kv.commited[op.Key]
+					oldV := ""
 					if !ok{
 						kv.commited[op.Key] = &op
+					}else{
+						oldV = old.Value
 					}
-					oldV := kv.commited[op.Key].Value
+
 					newV := oldV + op.Value
 					kv.commited[op.Key].Value = newV
 					kv.Log("append: arg:%s new:%s\n", op.String(), newV) 
@@ -226,6 +251,7 @@ func (kv *RaftKV) poll(){
 					result.Err = OK
 					result.Value = v.Value
 					kv.Log("get:arg:%s, result:%s\n", op.String(), v.Value)
+					kv.lastResult[op.From] = &GetReply{Err: OK, Value: v.Value, Seq: op.ID, From: kv.me}
 				}
 				kv.mu.Unlock()
 				ch <-result
@@ -272,10 +298,11 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	kv.pending = make(map[int]*PendingOp, 0)
 	kv.clientID = make(map[int]int, 0)
 	kv.cmdCh = make(chan *CMD, 64)
+	kv.lastResult = make(map[int]*GetReply, 0)
 	prefix := fmt.Sprintf("[%05d] ", me)
 	kv.log = log.New(os.Stdout, prefix, log.Ldate | log.Lshortfile | log.Lmicroseconds)
 
-	kv.applyCh = make(chan raft.ApplyMsg)
+	kv.applyCh = make(chan raft.ApplyMsg, 128)
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
 	go kv.poll()
 

@@ -44,5 +44,5 @@ type GetReply struct {
 	Err         Err
 	Value       string
 	Seq         int
-	From 	    int
+	From		int
 }
