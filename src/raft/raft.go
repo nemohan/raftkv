@@ -139,6 +139,7 @@ func (rf *Raft) persist() {
 	e := gob.NewEncoder(w)
 	e.Encode(rf.currentTerm)
 	e.Encode(rf.voted)
+	e.Encode(rf.votedID)
 	e.Encode(rf.commitIndex)
 	e.Encode(rf.nextIndex)
 	e.Encode(rf.matchIndex)
@@ -183,6 +184,7 @@ func (rf *Raft) readPersist(data []byte) {
 	d := gob.NewDecoder(r)
 	d.Decode(&rf.currentTerm)
 	d.Decode(&rf.voted)
+	d.Decode(&rf.votedID)
 	d.Decode(&rf.commitIndex)
 	d.Decode(&rf.nextIndex)
 	d.Decode(&rf.matchIndex)
@@ -348,6 +350,7 @@ func (rf *Raft) AppendEntry(arg AppendEntryArg, reply *AppendEntryReply){
 	rf.updateTerm(arg.Term)
 	rf.electionTimeout = time.Now()
 	rf.voted = false
+	rf.votedID = invalidNodeID
 	if arg.PrevLogIndex == invalidPrevLogIndex{
 		reply.OK = true
 		return
