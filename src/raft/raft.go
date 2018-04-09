@@ -92,6 +92,8 @@ type Raft struct {
 	applyCh chan ApplyMsg
 	logHandle *log.Logger
 	lastApplied int
+	votedMap map[int]int
+	lastVoteTerm int
 }
 
 type Voter struct{
@@ -503,11 +505,69 @@ func (rf *Raft) startVote(){
 		LastLogIndex: lastIdx,
 		LastLogTerm: lastTerm,
 	}
-
+	arg.Seq = getSeq()
+	rf.votedMap[rf.currentTerm] = 1
+	if rf.lastVoteTerm != 0{
+		delete(rf.votedMap, rf.lastVoteTerm)
+	}
+	rf.lastVoteTerm = rf.currentTerm
 	rf.mu.Unlock()
-	rf.prepareVote(&arg)
+	for id, _ := range rf.peers{
+		if id == rf.me{
+			continue
+		}
+		go rf.prepareVote(id, &arg)
+	}
 }
+/*
+func (rf *Raft) resetLastVote(){
+	delete(rf.votedMap, rf.lastVoteTerm)
+	rf.lastVoteTerm = 0
+}
+*/
+func (rf *Raft) prepareVote(id int, arg *RequestVoteArgs){
+	reply := &RequestVoteReply{}
+	if ok := rf.sendRequestVote(id, *arg, reply); !ok{
+		rf.logHandle.Printf("me:%d Failed request vote on id:%d arg:%s seq:%d\n", rf.me, id, arg.String(), arg.Seq)
+		return
+	}
 
+	majority := len(rf.peers) /2 + 1
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
+	//the result check must follow this order
+	//we are still in candidate state ?
+	if stateCandidate != rf.state{
+		return
+	}
+
+	//This condition implies the VoteGranted is false
+	if reply.Term > rf.currentTerm{
+		rf.state = stateFollower
+		rf.currentTerm = reply.Term
+		goto reset
+	}
+	if !reply.VoteGranted || rf.lastVoteTerm != rf.currentTerm{
+		return
+	}
+	rf.votedMap[rf.currentTerm]++
+	if rf.votedMap[rf.currentTerm] >= majority{
+		rf.state = stateLeader
+		rf.logHandle.Printf("currentTerm:%d  state:%s \n", rf.currentTerm, stateTable[stateLeader]) 
+		goto reset
+	}
+	//split vote
+	return
+
+	reset:
+	delete(rf.votedMap, rf.lastVoteTerm)
+	rf.lastVoteTerm = 0
+	rf.voted = false
+	rf.electionTimeout = time.Now()
+	return
+}
+/*
 func (rf *Raft) prepareVote(arg *RequestVoteArgs){
 	majority := len(rf.peers) / 2 + 1
 	arg.Seq = getSeq()
@@ -573,7 +633,7 @@ func (rf *Raft) prepareVote(arg *RequestVoteArgs){
 	rf.logHandle.Printf("me:%d current state:%s on term:%d\n", rf.me, stateTable[state], rf.currentTerm)
 
 }
-
+*/
 func (rf *Raft) getLastLogID()int{
 	prevIndex := -1
 	for idx, _ := range rf.log{
@@ -884,6 +944,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.applyCh = applyCh
 	rf.nextIndex = make(map[int]int, len(peers))
 	rf.matchIndex = make(map[int]int, len(peers))
+	rf.votedMap = make(map[int]int, 1)
 	rf.log[0] = &Command{ Index:0, Term: -1, Cmd: nil} //place holder
 	rf.cmdIndex = 1
 	rf.logHandle = log.New(os.Stdout, fmt.Sprintf("[me:%03d] ", rf.me), log.Ltime | log.Lmicroseconds | log.Lshortfile)
