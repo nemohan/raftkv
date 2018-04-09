@@ -58,6 +58,7 @@ var stateTable = map[int]string{
 	stateLeader: "LEADER",
 }
 const invalidPrevLogIndex = -1
+const invalidNodeID = -1
 //
 // A Go object implementing a single Raft peer.
 //
@@ -94,6 +95,7 @@ type Raft struct {
 	lastApplied int
 	votedMap map[int]int
 	lastVoteTerm int
+	votedID    int
 }
 
 type Voter struct{
@@ -138,6 +140,13 @@ func (rf *Raft) persist() {
 	e.Encode(rf.currentTerm)
 	e.Encode(rf.voted)
 	e.Encode(rf.commitIndex)
+	e.Encode(rf.nextIndex)
+	e.Encode(rf.matchIndex)
+	/*
+	for i, index := range rf.nextIndex{
+		rf.logHandle.Printf("node id:%d nextINDEX:%d\n", i, index)
+	}
+	*/
 	indexs := make([]int, 0)
 	logCopy := make(map[int]*Command, len(rf.log) -1)
 		for i, cmd := range rf.log{
@@ -175,10 +184,17 @@ func (rf *Raft) readPersist(data []byte) {
 	d.Decode(&rf.currentTerm)
 	d.Decode(&rf.voted)
 	d.Decode(&rf.commitIndex)
+	d.Decode(&rf.nextIndex)
+	d.Decode(&rf.matchIndex)
+	/*
+	for i, index := range rf.nextIndex{
+		rf.logHandle.Printf("node id:%d dnextINDEX:%d\n", i, index)
+	}
+	*/
 	d.Decode(&rf.log)
 	rf.logHandle.Printf("load term:%d voted:%v\n", rf.currentTerm, rf.voted)
 	index := 0
-	indexs := make([]int,0) 
+	indexs := make([]int,0)
 	for i, cmd := range rf.log{
 		//rf.logHandle.Printf("load cmd:%v\n", *cmd)
 		if cmd.Index > index{
@@ -260,6 +276,7 @@ func (rf *Raft) updateTerm(term int){
 		return
 	}
 	rf.currentTerm = term
+	//TODO: is this persist necessary
 	rf.persist()
 	if rf.state == stateFollower{
 		return
@@ -278,12 +295,21 @@ func (rf *Raft) RequestVote(args RequestVoteArgs, reply *RequestVoteReply) {
 		return
 	}
 	rf.updateTerm(args.Term)
-	if rf.voted && rf.votedTerm >= args.Term{
+	/**************Replace 2018/4/9 begin***************/
+	//Consider voted and reboot
+	/*
+	if rf.voted{
 		reply.VoteGranted = false
-		//reply.Term = rf.currentTerm
 		rf.logHandle.Printf("me:%d i'm already voted\n", rf.me)
 		return
 	}
+	*/
+	if rf.voted && rf.votedTerm >= args.Term{
+		reply.VoteGranted = false
+		rf.logHandle.Printf("me:%d i'm already voted\n", rf.me)
+		return
+	}
+	/************Replace 2018/4/9 end ***************/
 	//check logIdx and logTerm
 	lastIdx, lastTerm := rf.getLastLogInfo()
 	if args.LastLogTerm < lastTerm{
@@ -298,8 +324,10 @@ func (rf *Raft) RequestVote(args RequestVoteArgs, reply *RequestVoteReply) {
 	}
 	reply.VoteGranted = true
 	rf.voted = true
+	rf.votedID = args.CandidateID
 	rf.votedTerm = rf.currentTerm
 	rf.electionTimeout = time.Now()
+	rf.persist()
 }
 
 func (rf *Raft) AppendEntry(arg AppendEntryArg, reply *AppendEntryReply){
@@ -344,6 +372,7 @@ func (rf *Raft) deleteLogAfter(idx int){
 		}
 	}
 }
+
 func (rf *Raft) getMaxIndex()int{
 	max := -1
 	for idx, _ := range rf.log{
@@ -483,7 +512,12 @@ func (rf *Raft) broadcast(handler func(int)){
 
 func (rf *Raft) startVote(){
 	rf.mu.Lock()
-	if rf.state == stateLeader{
+	if rf.state == stateLeader{ 
+		rf.mu.Unlock()
+		return
+	}
+	//we voted another node
+	if rf.voted && (rf.votedID != invalidNodeID && rf.votedID != rf.me){
 		rf.mu.Unlock()
 		return
 	}
@@ -495,6 +529,7 @@ func (rf *Raft) startVote(){
 	rf.logHandle.Printf("me:%d election timeout, start vote\n",rf.me)
 	rf.state = stateCandidate
 	rf.voted = true
+	rf.votedID = rf.me
 	rf.currentTerm++
 	rf.votedTerm = rf.currentTerm
 	rf.electionTimeout = now
@@ -536,18 +571,20 @@ func (rf *Raft) prepareVote(id int, arg *RequestVoteArgs){
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
-	//the result check must follow this order
-	//we are still in candidate state ?
-	if stateCandidate != rf.state{
-		return
-	}
-
+	// The sanity check order does matter ********
 	//This condition implies the VoteGranted is false
 	if reply.Term > rf.currentTerm{
 		rf.state = stateFollower
 		rf.currentTerm = reply.Term
 		goto reset
 	}
+
+	//the result check must follow this order
+	//we are still in candidate state ?
+	if stateCandidate != rf.state{
+		return
+	}
+
 	if !reply.VoteGranted || rf.lastVoteTerm != rf.currentTerm{
 		return
 	}
@@ -564,6 +601,7 @@ func (rf *Raft) prepareVote(id int, arg *RequestVoteArgs){
 	delete(rf.votedMap, rf.lastVoteTerm)
 	rf.lastVoteTerm = 0
 	rf.voted = false
+	rf.votedID = invalidNodeID
 	rf.electionTimeout = time.Now()
 	return
 }
@@ -660,12 +698,11 @@ func (rf *Raft) getPrevLogInfo(isNew bool)(int, int){
 	if ok{
 		prevTerm = v.Term
 	}
-	return prevIndex,prevTerm 
+	return prevIndex,prevTerm
 }
 
 func (rf *Raft) heartbeat(){
 	rf.mu.Lock()
-	//defer rf.mu.Unlock()
 	if rf.state != stateLeader{
 		rf.mu.Unlock()
 		return
@@ -702,7 +739,7 @@ func (rf *Raft) doAppendEntry(isNew bool){
 		arg.Entries = make([]*Command, 0)
 		for i, c := range rf.log{
 			if i < nextIdx{
-				continue 
+				continue
 			}
 			//rf.logHandle.Printf("add entry:%v, nextIdx:%d to node:%d\n", c, nextIdx, idx)
 			arg.Entries = append(arg.Entries, c)
@@ -722,8 +759,6 @@ func (rf *Raft) doAppendEntry(isNew bool){
 			arg.PrevLogTerm = term
 			rf.logHandle.Printf("prev index:%d prev term:%d node:%d\n", arg.PrevLogIndex, arg.PrevLogTerm,idx)
 		}
-		/*
-		*/
 		args[idx] = &arg
 	}
 	if isNew{
@@ -793,6 +828,7 @@ func (rf *Raft) doAppendBottom(serverID int, arg *AppendEntryArg, seq uint32){
 func (rf *Raft) handleResult(resultChan <-chan *CommonReply){
 }
 
+//TODO: repeat commit same command can't happen
 func (rf *Raft) leaderCommit(){
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
@@ -814,8 +850,7 @@ func (rf *Raft) leaderCommit(){
 	if oldCommit == rf.commitIndex{
 		return
 	}
-	/*
-	*/
+
 	rf.persist()
 	msgs := make([]ApplyMsg, 0)
 	for i, v := range rf.log{
@@ -936,6 +971,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	for v < 100 {
 		v *=  start
 	}
+	rf.votedID = invalidNodeID
 	rf.timeoutValue = time.Duration(v) * time.Millisecond
 	rf.heartbeatTimeoutValue = 40 * time.Millisecond
 	rf.electionTimeout = time.Now()
@@ -956,7 +992,6 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	go rf.backgroundTask()
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
-
 
 	return rf
 }
