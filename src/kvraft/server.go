@@ -79,6 +79,7 @@ func (kv *RaftKV) Get(args *GetArgs, reply *GetReply) {
 	from := args.From
 	kv.mu.Lock()
 	max, ok := kv.clientID[from]
+
 	//TODO: how to handle the return value properly
 	if ok && args.Seq < max{
 		kv.mu.Unlock()
@@ -113,13 +114,19 @@ func (kv *RaftKV) Get(args *GetArgs, reply *GetReply) {
 		return
 	}
 	resultChan := kv.addPending(&op)
-	result := <-resultChan
-	reply.Value= result.Value
-	//reply.From = op.From
-	reply.From = kv.me
-	reply.Seq = args.Seq
-	reply.Err = OK
-	kv.Log("get result:%s key:%s reply:%v\n", reply.Value, key, reply)
+	select{
+		case <- time.After(time.Second):
+			reply.Err = ErrTimeout 
+			kv.removePending(&op)
+			kv.Log("get timeout args:%v\n", args)
+		case result := <-resultChan:
+			reply.Value= result.Value
+			//reply.From = op.From
+			reply.From = kv.me
+			reply.Seq = args.Seq
+			reply.Err = OK
+			kv.Log("get result:%s key:%s reply:%v\n", reply.Value, key, reply)
+	}
 }
 
 
@@ -149,7 +156,7 @@ func (kv *RaftKV) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	if !isLeader{
 		if num < 3{
 			num++
-			time.Sleep(time.Millisecond * 200 )
+			time.Sleep(time.Millisecond * 100 )
 			goto retry
 		}
 		reply.WrongLeader = true
@@ -157,9 +164,16 @@ func (kv *RaftKV) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 		return
 	}
 	ch := kv.addPending(&op)
-	result := <-ch
-	reply.Seq = args.Seq
-	reply.Err = Err(result.Err)
+	//handle partition
+	select{
+		case <-time.After(time.Second):
+			reply.Err = ErrTimeout
+			kv.removePending(&op)
+			kv.Log("put timeout args:%s\n", args.String())
+		case result := <-ch:
+			reply.Seq = args.Seq
+			reply.Err = Err(result.Err)
+	}
 }
 
 func (kv *RaftKV) addPending(op *Op) chan *Result{
@@ -208,53 +222,80 @@ func (kv *RaftKV) doPanic(info string){
 func (kv *RaftKV) timeout(){
 
 }
+
+func (kv *RaftKV) handlePut(op *Op, ch chan *Result) {
+	kv.mu.Lock()
+	defer kv.mu.Unlock()
+	kv.commited[op.Key] = op
+	kv.Log("put: arg:%s\n", op.String())
+	if ch == nil{
+		return
+	}
+
+	result := &Result{Err: OK}
+	ch <- result
+}
+
+func (kv *RaftKV) handleAppend(op *Op, ch chan *Result){
+	kv.mu.Lock()
+	defer kv.mu.Unlock()
+	old, ok := kv.commited[op.Key]
+	oldV := ""
+	if !ok{
+		kv.commited[op.Key] = op
+	}else{
+		oldV = old.Value
+	}
+
+	newV := oldV + op.Value
+	kv.commited[op.Key].Value = newV
+	kv.Log("append: arg:%s new:%s\n", op.String(), newV) 
+	if ch == nil{
+		return
+	}
+	result := &Result{Err: OK}
+	ch <- result
+}
+
+func (kv *RaftKV) handleGet(op *Op, ch chan *Result){
+	kv.mu.Lock()
+	defer kv.mu.Unlock()
+	err := OK
+	value := ""
+	v, ok := kv.commited[op.Key]
+	if !ok{
+		kv.Log("get: arg:%s not find\n", op.String())
+		err = ErrNoKey
+		goto out
+	}
+	value = v.Value
+	kv.Log("get:arg:%s, result:%s\n", op.String(), v.Value)
+	kv.lastResult[op.From] = &GetReply{Err: OK, Value: v.Value, Seq: op.ID, From: kv.me}
+
+	out :
+	if ch == nil{
+		return
+	}
+
+	ch <-&Result{Err: err, Value: value}
+}
 func (kv *RaftKV) poll(){
 	for{
 		select {
 			case msg := <-kv.applyCh:
 				op := msg.Command.(Op)
-				ch := kv.removePending(&op)
-				if ch == nil{
-					break
-				}
-				result := &Result{}
 				kv.mu.Lock()
+				kv.clientID[op.From] = op.ID
+				kv.mu.Unlock()
+				ch := kv.removePending(&op)
 				switch op.Cmd{
 				case "Put":
-					_, ok := kv.commited[op.Key]
-					if !ok{
-						kv.commited[op.Key] = &op
-					}
-					kv.commited[op.Key].Value = op.Value
-					kv.Log("put: arg:%s\n", op.String())
-					result.Err = OK
+					kv.handlePut(&op, ch)
 				case "Append":
-					old, ok := kv.commited[op.Key]
-					oldV := ""
-					if !ok{
-						kv.commited[op.Key] = &op
-					}else{
-						oldV = old.Value
-					}
-
-					newV := oldV + op.Value
-					kv.commited[op.Key].Value = newV
-					kv.Log("append: arg:%s new:%s\n", op.String(), newV) 
-					result.Err = OK
+					kv.handleAppend(&op, ch)
 				case "Get":
-					v, ok := kv.commited[op.Key]
-					if !ok{
-						kv.Log("get: arg:%s not find\n", op.String())
-						result.Err = ErrNoKey
-						break
-					}
-					result.Err = OK
-					result.Value = v.Value
-					kv.Log("get:arg:%s, result:%s\n", op.String(), v.Value)
-					kv.lastResult[op.From] = &GetReply{Err: OK, Value: v.Value, Seq: op.ID, From: kv.me}
+					kv.handleGet(&op, ch)
 				}
-				kv.mu.Unlock()
-				ch <-result
 			default:
 				time.Sleep(time.Millisecond * 10)
 		}

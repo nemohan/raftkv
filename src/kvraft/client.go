@@ -57,12 +57,9 @@ func (ck *Clerk) Get(key string) string {
 	retry:
 	arg := &GetArgs{Key : key, Seq : seq, From: int(ck.id)}
 	reply := &GetReply{}
+	fmt.Printf("c:%d get key:%s seq:%d\n", ck.id, key, seq)
 	if ck.leader != -1{
 		ok := ck.servers[ck.leader].Call("RaftKV.Get", arg, reply)
-		if reply.WrongLeader{
-			fmt.Printf("c:%d get key failed:%s from leader change:%d\n", ck.id, key, ck.leader)
-			goto next
-		}
 		if !ok {
 			fmt.Printf("c:%d get key failed:%s from leader:%d\n", ck.id, key, ck.leader)
 			if num < 2{
@@ -71,6 +68,12 @@ func (ck *Clerk) Get(key string) string {
 			}
 			goto next
 		}
+
+		if reply.WrongLeader || reply.Err == ErrTimeout{
+			fmt.Printf("c:%d get key failed:%s from leader change:%d\n", ck.id, key, ck.leader)
+			goto next
+		}
+
 		fmt.Printf("c:%d get key:%s :%v leader index:%d\n", ck.id, key, reply, ck.leader)
 		return reply.Value
 	}
@@ -78,7 +81,7 @@ func (ck *Clerk) Get(key string) string {
 	for i, c := range ck.servers{
 		reply := &GetReply{}
 		ok := c.Call("RaftKV.Get", arg, reply)
-		if !ok || reply.WrongLeader{
+		if !ok || reply.WrongLeader || reply.Err == ErrTimeout{
 			fmt.Printf("c:%d get key:%s client reply:%v to:%d from:%d failed rpc:%v\n", ck.id, key, reply, i, reply.From, ok)
 			continue
 		}
@@ -86,6 +89,8 @@ func (ck *Clerk) Get(key string) string {
 		fmt.Printf("c:%d get key:%s 1:%v leader index:%d from:%d\n", ck.id, key, reply, i, reply.From)
 		return reply.Value
 	}
+	time.Sleep(time.Millisecond * 20)
+	goto next
 	fmt.Printf("c:%d get nothing key:%s\n", ck.id, key)
 	return value
 }
@@ -105,6 +110,7 @@ func (ck *Clerk) PutAppend(key string, value string, op string) {
 	seq := ck.seq
 	ck.seq++
 	num := 0
+
 	retry:
 	arg := &PutAppendArgs{Key: key, Value: value, Op: op, Seq:seq, From:int(ck.id)}
 	fmt.Printf("c:%d client put:%s\n", ck.id, arg.String())
@@ -118,10 +124,11 @@ func (ck *Clerk) PutAppend(key string, value string, op string) {
 				goto retry
 			}
 		}
-		if !reply.WrongLeader{
+		if !reply.WrongLeader || reply.Err == ErrTimeout{
 			goto next
 		}
 		if reply.Err == OK{
+			fmt.Printf("c:%d client put:%s success leader index:%d \n", ck.id, arg.String(), ck.leader)
 			return
 		}
 	}
@@ -129,12 +136,15 @@ func (ck *Clerk) PutAppend(key string, value string, op string) {
 	for i, c := range ck.servers{
 		reply := &PutAppendReply{}
 		ok := c.Call("RaftKV.PutAppend", arg, reply)
-		if !ok || reply.WrongLeader{
+		if !ok || reply.WrongLeader || reply.Err == ErrTimeout{
 			continue
 		}
 		ck.leader = i
+		fmt.Printf("c:%d client put:%s ok leader index:%d\n", ck.id, arg.String(), ck.leader)
 		return
 	}
+	goto next
+	time.Sleep(time.Millisecond * 20)
 
 }
 
