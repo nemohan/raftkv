@@ -79,7 +79,7 @@ func (kv *RaftKV) Get(args *GetArgs, reply *GetReply) {
 	from := args.From
 	kv.mu.Lock()
 	max, ok := kv.clientID[from]
-
+	kv.Log("get key:%s seq:%d max:%d\n", args.Key, args.Seq, max)
 	//TODO: how to handle the return value properly
 	if ok && args.Seq < max{
 		kv.mu.Unlock()
@@ -93,11 +93,16 @@ func (kv *RaftKV) Get(args *GetArgs, reply *GetReply) {
 			kv.Log("miss for key:%s arg: from:%d seq:%d\n", args.Key, args.From, args.Seq)
 			return
 		}
-		*reply = *oldReply 
+		if oldReply.Seq < args.Seq{
+			goto out
+		}
+		*reply = *oldReply
 		kv.mu.Unlock()
 		kv.Log("last hit for key:%s reply:%v\n", args.Key, reply)
 		return
 	}
+
+	out:
 	kv.mu.Unlock()
 	key := args.Key
 	 op := Op{
@@ -118,7 +123,12 @@ func (kv *RaftKV) Get(args *GetArgs, reply *GetReply) {
 		case <- time.After(time.Second):
 			reply.Err = ErrTimeout 
 			kv.removePending(&op)
-			kv.Log("get timeout args:%v\n", args)
+			/*
+			kv.mu.Lock()
+			kv.clientID[from] = lastRequestID
+			kv.mu.Unlock()
+			*/
+			kv.Log("get timeout args:%v key:%s\n", args, args.Key)
 		case result := <-resultChan:
 			reply.Value= result.Value
 			//reply.From = op.From
@@ -141,6 +151,7 @@ func (kv *RaftKV) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 		kv.mu.Unlock()
 		return
 	}
+	//lastRequestID := max
 	kv.mu.Unlock()
 	 op := Op{
 		Key : args.Key,
@@ -169,6 +180,11 @@ func (kv *RaftKV) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 		case <-time.After(time.Second):
 			reply.Err = ErrTimeout
 			kv.removePending(&op)
+			/*
+			kv.mu.Lock()
+			kv.clientID[from] = lastRequestID
+			kv.mu.Unlock()
+			*/
 			kv.Log("put timeout args:%s\n", args.String())
 		case result := <-ch:
 			reply.Seq = args.Seq
@@ -180,7 +196,7 @@ func (kv *RaftKV) addPending(op *Op) chan *Result{
 	kv.mu.Lock()
 	defer kv.mu.Unlock()
 	from := op.From
-	kv.clientID[from] = op.ID
+	//kv.clientID[from] = op.ID
 	kv.Log("seq id:%d from:%d\n", op.ID, from)
 	pending, ok := kv.pending[from]
 	if !ok{
@@ -279,15 +295,51 @@ func (kv *RaftKV) handleGet(op *Op, ch chan *Result){
 
 	ch <-&Result{Err: err, Value: value}
 }
+
+func (kv *RaftKV) checkRepeat(op *Op) (chan *Result, bool){
+	kv.mu.Lock()
+	//defer kv.mu.Unlock()
+	isRepeat := false
+	lastRequestID, ok := kv.clientID[op.From]
+
+	kv.Log("reqid:%d last id:%d\n", op.ID, lastRequestID)
+	if ok && op.ID <= lastRequestID{
+		isRepeat = true
+		kv.Log("detect repeat id:%d last id:%d\n", op.ID, lastRequestID)
+		goto out
+	}
+	kv.clientID[op.From] = op.ID
+	out:
+	kv.mu.Unlock()
+	ch := kv.removePending(op)
+	if !isRepeat || ch == nil{
+		return ch, isRepeat
+	}
+
+	kv.mu.Lock()
+	defer kv.mu.Unlock()
+	if op.Cmd == "Put" || op.Cmd == "Append"{
+		ch <- &Result{Err: OK}
+	}else{
+		value := ""
+		v, ok := kv.commited[op.Key]
+		if ok{
+			value = v.Value
+		}
+		ch <- &Result{Err: OK, Value:value}
+	}
+	return ch, isRepeat
+}
+
 func (kv *RaftKV) poll(){
 	for{
 		select {
 			case msg := <-kv.applyCh:
 				op := msg.Command.(Op)
-				kv.mu.Lock()
-				kv.clientID[op.From] = op.ID
-				kv.mu.Unlock()
-				ch := kv.removePending(&op)
+				ch, isRepeat := kv.checkRepeat(&op)
+				if isRepeat{
+					continue
+				}
 				switch op.Cmd{
 				case "Put":
 					kv.handlePut(&op, ch)
@@ -345,6 +397,44 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 
 	kv.applyCh = make(chan raft.ApplyMsg, 128)
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
+	cmdArray , commitIndex:= kv.rf.GetLogs()
+	for _, cmd := range cmdArray{
+		op := cmd.(Op)
+		if op.ID > commitIndex{
+			continue
+		}
+		kv.clientID[op.From] = op.ID
+		if op.Cmd == "Put"{
+			kv.commited[op.Key] = &op
+		}
+		if op.Cmd == "Append"{
+			oldValue := ""
+			oldOp, ok := kv.commited[op.Key]
+			if ok{
+				oldValue = oldOp.Value
+				oldOp.Value = oldValue + op.Value
+				continue
+			}
+			kv.commited[op.Key] = &op
+		}
+		if op.Cmd == "Get"{
+			err := ErrNoKey
+			oldValue := ""
+			oldOp, ok := kv.commited[op.Key]
+			if ok{
+				err = OK
+				oldValue = oldOp.Value
+			}
+			kv.lastResult[op.From] = &GetReply{Err: Err(err), Value: oldValue, Seq: op.ID, From: kv.me}
+		}
+	}
+
+	for key, cmd := range kv.commited{
+		kv.Log("restore key:%s value:%s\n", key, cmd.Value)
+	}
+	for from, id := range kv.clientID{
+		kv.Log("record from:%d id:%d\n", from, id)
+	}
 	go kv.poll()
 
 	return kv

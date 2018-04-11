@@ -4,6 +4,7 @@ import "fmt"
 const (
 	OK       = "OK"
 	ErrNoKey = "ErrNoKey"
+	ErrTimeout = "ErrTimeout"
 )
 
 type Err string
@@ -23,7 +24,7 @@ type PutAppendArgs struct {
 }
 
 func (p *PutAppendArgs) String()string{
-	return fmt.Sprintf("key:%s value:%s op:%s seq:%d from:%d\n", p.Key, p.Value, p.Op, p.Seq, p.From)
+	return fmt.Sprintf("key:%s value:%s op:%s seq:%d from:%d ", p.Key, p.Value, p.Op, p.Seq, p.From)
 }
 type PutAppendReply struct {
 	WrongLeader bool

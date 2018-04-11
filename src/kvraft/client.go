@@ -113,7 +113,7 @@ func (ck *Clerk) PutAppend(key string, value string, op string) {
 
 	retry:
 	arg := &PutAppendArgs{Key: key, Value: value, Op: op, Seq:seq, From:int(ck.id)}
-	fmt.Printf("c:%d client put:%s\n", ck.id, arg.String())
+	fmt.Printf("c:%d client  leader idx:%d put:%s \n", ck.id, ck.leader, arg.String())
 	reply := &PutAppendReply{}
 	if ck.leader != -1{
 		ok := ck.servers[ck.leader].Call("RaftKV.PutAppend", arg, reply)
