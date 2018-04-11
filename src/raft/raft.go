@@ -173,7 +173,7 @@ func (rf *Raft) persist() {
 //
 // restore previously persisted state.
 //
-func (rf *Raft) readPersist(data []byte) {
+func (rf *Raft) ReadPersist(data []byte) {
 	// Your code here.
 	// Example:
 	// r := bytes.NewBuffer(data)
@@ -210,6 +210,25 @@ func (rf *Raft) readPersist(data []byte) {
 }
 
 
+func (rf *Raft) GetLogs()([]interface{}, int){
+	if len(rf.log) == 0{
+		return nil, -1
+	}
+	cmdArray := make([]interface{}, len(rf.log) -1)
+	indexs := make([]int, 0)
+	for i, cmd := range rf.log{
+		if cmd.Index == 0{
+			continue
+		}
+		indexs = append(indexs, i)
+	}
+	sort.Slice(indexs, func(i, j int)bool{return indexs[i] < indexs[j]})
+
+	for i, cmdID := range indexs{
+		cmdArray[i] = rf.log[cmdID].Cmd 
+	}
+	return cmdArray, rf.commitIndex
+}
 var seqSource uint32 = 0
 func getSeq()uint32{
 	return atomic.AddUint32(&seqSource, 1)
@@ -994,7 +1013,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	}
 	go rf.backgroundTask()
 	// initialize from state persisted before a crash
-	rf.readPersist(persister.ReadRaftState())
+	rf.ReadPersist(persister.ReadRaftState())
 
 	return rf
 }

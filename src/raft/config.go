@@ -56,7 +56,6 @@ func make_config(t *testing.T, n int, unreliable bool) *config {
 	cfg.setunreliable(unreliable)
 
 	cfg.net.LongDelays(true)
-
 	// create a full set of Rafts.
 	for i := 0; i < cfg.n; i++ {
 		cfg.logs[i] = map[int]int{}
@@ -125,9 +124,7 @@ func (cfg *config) start1(i int) {
 		ends[j] = cfg.net.MakeEnd(cfg.endnames[i][j])
 		cfg.net.Connect(cfg.endnames[i][j], j)
 	}
-
 	cfg.mu.Lock()
-
 	// a fresh persister, so old instance doesn't overwrite
 	// new instance's persisted state.
 	// but copy old persister's content so that we always
@@ -175,7 +172,6 @@ func (cfg *config) start1(i int) {
 			}
 		}
 	}()
-
 	rf := Make(ends, i, cfg.saved[i], applyCh)
 
 	cfg.mu.Lock()
