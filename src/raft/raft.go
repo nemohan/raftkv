@@ -51,6 +51,11 @@ const (
 	stateCandidate
 	stateLeader
 )
+type Snapshot struct{
+	lastTerm int
+	lastIndex int
+	snapshot []byte
+}
 
 var stateTable = map[int]string{
 	stateFollower: "FOLLOWER",
@@ -96,6 +101,8 @@ type Raft struct {
 	votedMap map[int]int
 	lastVoteTerm int
 	votedID    int
+	snapshot  *Snapshot 
+	isSnapshoted bool
 }
 
 type Voter struct{
@@ -117,6 +124,36 @@ func (rf *Raft) GetState() (int, bool) {
 	return term, isleader
 }
 
+func (rf *Raft) createSnapshot(lastIncludedIndex int)[]byte{
+	w := new(bytes.Buffer)
+	e := gob.NewEncoder(w)
+	/*
+	e.Encode(rf.currentTerm)
+	e.Encode(rf.voted)
+	e.Encode(rf.votedID)
+	e.Encode(rf.commitIndex)
+	e.Encode(rf.nextIndex)
+	e.Encode(rf.matchIndex)
+	*/
+	indexs := make([]int, 0)
+	logCopy := make(map[int]*Command, len(rf.log) -1)
+	for i, cmd := range rf.log{
+		//if i == 0 || i > rf.commitIndex{
+		if i == 0 || i > lastIncludedIndex{
+			continue
+		}
+		logCopy[i] = cmd
+		indexs = append(indexs, i)
+	}
+	e.Encode(rf.commitIndex)
+	//e.Encode(rf.log[rf.commitIndex].Term)
+	e.Encode(rf.log[lastIncludedIndex].Term)
+	e.Encode(logCopy)
+	data := w.Bytes()
+	//rf.logHandle.Printf("save snapshot term:%d voted:%v\n", rf.currentTerm, rf.voted)
+	sort.Slice(indexs, func(i, j int)bool{ return indexs[i] < indexs[j]})
+	return data
+}
 //
 // save Raft's persistent state to stable storage,
 // where it can later be retrieved after a crash and restart.
@@ -131,10 +168,6 @@ func (rf *Raft) persist() {
 	// e.Encode(rf.yyy)
 	// data := w.Bytes()
 	// rf.persister.SaveRaftState(data)
-	/*
-	rf.mu.Lock()
-	defer rf.mu.Unlock()
-	*/
 	w := new(bytes.Buffer)
 	e := gob.NewEncoder(w)
 	e.Encode(rf.currentTerm)
@@ -143,7 +176,7 @@ func (rf *Raft) persist() {
 	e.Encode(rf.commitIndex)
 	e.Encode(rf.nextIndex)
 	e.Encode(rf.matchIndex)
-	/*
+	/* use less
 	for i, index := range rf.nextIndex{
 		rf.logHandle.Printf("node id:%d nextINDEX:%d\n", i, index)
 	}
@@ -159,15 +192,16 @@ func (rf *Raft) persist() {
 		}
 		e.Encode(logCopy)
 	data := w.Bytes()
+	//data := rf.encode()
 	rf.persister.SaveRaftState(data)
 	rf.logHandle.Printf("save term:%d voted:%v\n", rf.currentTerm, rf.voted)
-	/*
+	/* debug
 	for _, cmd := range logCopy{
 		//rf.logHandle.Printf("save cmd:%v\n", *cmd)
 	}
 	*/
 	sort.Slice(indexs, func(i, j int)bool{ return indexs[i] < indexs[j]})
-	//rf.logHandle.Printf("save:%v\n", indexs)
+	rf.logHandle.Printf("save:%v\n", indexs)
 }
 
 //
@@ -207,6 +241,162 @@ func (rf *Raft) ReadPersist(data []byte) {
 	sort.Slice(indexs, func(i, j int)bool{return indexs[i] < indexs[j]})
 	//rf.logHandle.Printf("load cmd:%v\n", indexs)
 	rf.cmdIndex = index+1
+}
+
+
+func (rf *Raft) LoadSnapshot()[]byte{
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
+	data := rf.persister.ReadSnapshot()
+	if data == nil{
+		return data
+	}
+	logSize := readSize(data)
+	logData := make([]byte, logSize)
+	copy(logData, data[4:])
+
+	/*
+	r := bytes.NewBuffer(data)
+	d := gob.NewDecoder(r)
+	sn := &Snapshot{}
+	d.Decode(&sn.lastIndex)
+	d.Decode(&sn.lastTerm)
+	d.Decode(
+	size := 0
+	d.Decode(&size)
+	*/
+
+	//stateSize := readSize(data[4 + logSize:])
+	return data[8 + logSize:]
+}
+
+
+
+func writeSize(src []byte, size int){
+	src[0] = byte((size >> 24) & 0xff)
+	src[1] = byte((size >> 16) & 0xff)
+	src[2] = byte((size >> 8) & 0xff)
+	src[3] = byte(size & 0xff)
+}
+
+func readSize(src []byte) int{
+	size := int(src[0]) << 24
+	size |= int(src[1]) << 16
+	size |= int(src[2]) << 8
+	size |= int(src[3])
+	return size
+}
+
+func (rf *Raft) syncSnapshot(){
+	rf.mu.Lock()
+	if rf.snapshot == nil{
+		rf.mu.Unlock()
+		return
+	}
+
+	nodes := make([]int, 0)
+	oldSnapshot := rf.snapshot
+	snapshot := &Snapshot{}
+	currentTerm := rf.currentTerm
+	for idx, _ := range rf.peers{
+		nextIdx := rf.nextIndex[idx]
+		if rf.snapshot.lastIndex < nextIdx{
+			continue
+		}
+		nodes = append(nodes, idx)
+	}
+	if len(nodes) > 0{
+		snapshot.lastIndex = oldSnapshot.lastIndex
+		snapshot.lastTerm = oldSnapshot.lastTerm
+		snapshot.snapshot = make([]byte, len(oldSnapshot.snapshot))
+		copy(snapshot.snapshot, oldSnapshot.snapshot)
+	}
+	rf.mu.Unlock()
+	for _, id := range nodes{
+		if id == rf.me{
+			continue
+		}
+		go rf.doSyncSnapshot(id, snapshot, currentTerm)
+	}
+}
+
+func (rf *Raft) doSyncSnapshot(nodeID int, snapshot *Snapshot, currentTerm int){
+	arg := &SnapshotArg{
+		Term: currentTerm,
+		LeaderID: rf.me,
+		LastIncludedIndex: snapshot.lastIndex,
+		LastIncludedTerm: snapshot.lastTerm,
+		Offset : 0,
+		Data: snapshot.snapshot,
+		Done: true,
+	}
+	reply := &SnapshotReply{}
+	if ok := rf.sendSnapshot(nodeID, arg, reply); !ok{
+		rf.logHandle.Printf("sync snapshot11 to node:%d failed\n", nodeID)
+		return
+	}
+	//update next idx
+	//update my state
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
+	//TODO: Is this right ? 
+	if reply.Term > rf.currentTerm{
+		rf.state = stateFollower
+		rf.electionTimeout = time.Now()
+		return
+	}
+
+	rf.nextIndex[nodeID] = snapshot.lastIndex + 1
+	rf.matchIndex[nodeID] = snapshot.lastIndex
+
+}
+
+
+//BUG: the commit index in kvserver may be different the raft's commit index
+//so we use the lastIndex from kvserver instead of raft's rf.commitIndex
+func (rf *Raft) InstallSnapshot(stateData []byte, lastIndex int){
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	if rf.commitIndex == 0 || (rf.snapshot != nil && rf.snapshot.lastIndex >= rf.commitIndex){
+		return
+	}
+
+	rf.logHandle.Printf("install snapshot lastIndex:%d commitIndex:%d\n", lastIndex, rf.commitIndex)
+	_, ok := rf.log[lastIndex]
+	if !ok{
+		msg := fmt.Sprintf(" me:%d commit index:%d\n", rf.me, rf.commitIndex)
+		panic(msg)
+	}
+	rf.snapshot = &Snapshot{
+		//lastIndex:rf.commitIndex,
+		//lastTerm:rf.log[rf.commitIndex].Term,
+		lastIndex: lastIndex,
+		lastTerm: rf.log[lastIndex].Term,
+	}
+
+	data := rf.createSnapshot(lastIndex)
+	logSize := len(data)
+	stateSize := len(stateData)
+	snapshot := make([]byte, logSize + stateSize + 8)
+	writeSize(snapshot, logSize)
+	copy(snapshot[4:], data)
+
+	writeSize(snapshot[4 + logSize:], stateSize)
+	copy(snapshot[8 + logSize:], stateData)
+	rf.persister.SaveSnapshot(snapshot)
+	//keep the last commited index in log
+	for idx, _ := range rf.log{
+		//if idx == 0 || idx >= rf.commitIndex{
+		if idx == 0 || idx >= lastIndex{
+			continue
+		}
+		delete(rf.log, idx)
+	}
+	rf.isSnapshoted = true
+	rf.snapshot.snapshot = snapshot
+	rf.persist()
 }
 
 
@@ -275,6 +465,19 @@ type AppendEntryReply struct{
 	LastCommitIndex int
 }
 
+type SnapshotArg struct{
+	Term int
+	LeaderID int
+	LastIncludedIndex int
+	LastIncludedTerm int
+	Offset int
+	Data []byte
+	Done bool
+}
+
+type SnapshotReply struct{
+	Term int
+}
 type CommonReply struct{
 	ok bool
 	from int
@@ -304,6 +507,60 @@ func (rf *Raft) updateTerm(term int){
 	}
 	rf.state = stateFollower
 }
+
+
+// Persist the snapshot then reply
+func (rf *Raft) RequestSnapshot(args SnapshotArg, reply *SnapshotReply){
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	rf.logHandle.Printf("receive snapshot from:%d lastIndex:%d lastTerm:%d\n", args.LeaderID, args.LastIncludedIndex, args.LastIncludedTerm)
+	//defer rf.mu.Unlock()
+	if args.Term < rf.currentTerm{
+		reply.Term = rf.currentTerm
+		rf.logHandle.Printf("reject snapshot from:%d term:%d  my term:%d\n", args.LeaderID, args.Term, rf.currentTerm)
+		//rf.mu.Unlock()
+		return
+	}
+	rf.persister.SaveSnapshot(args.Data)
+	rf.snapshot = &Snapshot{
+		lastIndex: args.LastIncludedIndex,
+		lastTerm : args.LastIncludedTerm,
+		snapshot: args.Data,
+	}
+	reply.Term = rf.currentTerm
+	rf.electionTimeout = time.Now()
+	rf.doBackgroundSnapshot()
+	
+}
+
+func (rf *Raft) doBackgroundSnapshot(){
+	if rf.commitIndex >= rf.snapshot.lastIndex{
+		return
+	}
+	data := rf.snapshot.snapshot
+	logSize := readSize(data)
+	logData := make([]byte, logSize)
+	copy(logData, data[4:])
+	stateSize := readSize(data[4 + logSize:])
+	stateData := make([]byte,stateSize)
+	copy(stateData, data[8 + logSize:])
+	rf.logHandle.Printf("received stateSize:%d\n",stateSize) 
+
+	lastIndex := rf.snapshot.lastIndex
+	lastTerm := rf.snapshot.lastTerm
+	//restore kvserver
+	rf.applyCh <- ApplyMsg{UseSnapshot: true, Snapshot: stateData}
+	rf.commitIndex = rf.snapshot.lastIndex
+
+	rf.log[lastIndex] = &Command{Index: lastIndex, Term:lastTerm} 
+	end := rf.commitIndex
+	for i, _ := range rf.peers{
+		rf.nextIndex[i] = end +1
+		rf.matchIndex[i] = end
+		rf.logHandle.Printf("peer:%d matchIndex:%d\n", i, end)
+	}
+}
+
 
 func (rf *Raft) RequestVote(args RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here.
@@ -522,6 +779,9 @@ func (rf *Raft) sendAppendEntry(server int, arg AppendEntryArg, reply *AppendEnt
 	return rf.peers[server].Call("Raft.AppendEntry", arg, reply)
 }
 
+func (rf *Raft) sendSnapshot(server int, arg *SnapshotArg, reply *SnapshotReply) bool{
+	return rf.peers[server].Call("Raft.RequestSnapshot", *arg, reply)
+}
 
 func (rf *Raft) broadcast(handler func(int)){
 	for id, _ := range rf.peers{
@@ -713,6 +973,7 @@ func (rf *Raft) getPrevLogInfo(isNew bool)(int, int){
 	prevIndex := rf.getLastLogID()
 	prevTerm := -1
 	rf.logHandle.Printf(" new:%v cmd index:%d prevIndex:%d\n", isNew, rf.cmdIndex, prevIndex)
+
 	if isNew{
 		prevIndex--
 	}
@@ -837,7 +1098,7 @@ func (rf *Raft) doAppendBottom(serverID int, arg *AppendEntryArg, seq uint32){
 			matchIdx = i
 		}
 	}
-	rf.logHandle.Printf("matchIndex:%d nextIdx:%d seq:%d node:%d\n", matchIdx, nextIdx, seq, serverID)
+	rf.logHandle.Printf("matchIndex:%d nextIdx:%d seq:%d node:%d incur:%v\n", matchIdx, nextIdx, seq, serverID, incrNext)
 	if incrNext{
 		rf.nextIndex[serverID] = nextIdx + 1
 	}
@@ -913,6 +1174,7 @@ func (rf *Raft) backgroundTask(){
 			default:
 				rf.startVote()
 				rf.heartbeat()
+				rf.syncSnapshot()
 				time.Sleep(10 *time.Millisecond)
 		}
 

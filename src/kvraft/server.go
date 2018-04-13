@@ -1,6 +1,7 @@
 package raftkv
 
 import (
+	"bytes"
 	"encoding/gob"
 	"fmt"
 	"labrpc"
@@ -63,6 +64,8 @@ type RaftKV struct {
 	log *log.Logger
 	cmdCh chan *CMD
 	lastResult map[int]*GetReply
+	persister *raft.Persister
+	lastIndex int
 }
 
 func (kv *RaftKV) Log(format string, arg ...interface{}){
@@ -331,10 +334,38 @@ func (kv *RaftKV) checkRepeat(op *Op) (chan *Result, bool){
 	return ch, isRepeat
 }
 
+func (kv *RaftKV) installSnapshot(){
+	kv.mu.Lock()
+	defer kv.mu.Unlock()
+	if kv.persister.RaftStateSize() < kv.maxraftstate{
+		return
+	}
+	kv.Log("state size:%d\n", kv.persister.RaftStateSize())
+	w := new(bytes.Buffer)
+        e := gob.NewEncoder(w)
+	e.Encode(kv.commited)
+	data := w.Bytes()
+	kv.rf.InstallSnapshot(data, kv.lastIndex)
+	kv.Log("state size:%d after snapshot\n", kv.persister.RaftStateSize())
+}
+
+func (kv *RaftKV) readSnapshot(){
+
+}
+
 func (kv *RaftKV) poll(){
 	for{
 		select {
 			case msg := <-kv.applyCh:
+				if msg.UseSnapshot{
+					kv.recoverFromSnapshot(msg.Snapshot)
+					break
+				}
+				kv.mu.Lock()
+				if kv.lastIndex < msg.Index{
+					kv.lastIndex = msg.Index
+				}
+				kv.mu.Unlock()
 				op := msg.Command.(Op)
 				ch, isRepeat := kv.checkRepeat(&op)
 				if isRepeat{
@@ -350,6 +381,7 @@ func (kv *RaftKV) poll(){
 				}
 			default:
 				time.Sleep(time.Millisecond * 10)
+				kv.installSnapshot()
 		}
 	}
 }
@@ -364,39 +396,31 @@ func (kv *RaftKV) Kill() {
 	// Your code here, if desired.
 }
 
-//
-// servers[] contains the ports of the set of
-// servers that will cooperate via Raft to
-// form the fault-tolerant key/value service.
-// me is the index of the current server in servers[].
-// the k/v server should store snapshots with persister.SaveSnapshot(),
-// and Raft should save its state (including log) with persister.SaveRaftState().
-// the k/v server should snapshot when Raft's saved state exceeds maxraftstate bytes,
-// in order to allow Raft to garbage-collect its log. if maxraftstate is -1,
-// you don't need to snapshot.
-// StartKVServer() must return quickly, so it should start goroutines
-// for any long-running work.
-//
-func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister, maxraftstate int) *RaftKV {
-	// call gob.Register on structures you want
-	// Go's RPC library to marshall/unmarshall.
-	gob.Register(Op{})
+//We need load snapshot and raft state
+//There is window between snapshot and raft state
 
-	kv := new(RaftKV)
-	kv.me = me
-	kv.maxraftstate = maxraftstate
 
-	// Your initialization code here.
-	kv.commited = make(map[string]*Op, 0)
-	kv.pending = make(map[int]*PendingOp, 0)
-	kv.clientID = make(map[int]int, 0)
-	kv.cmdCh = make(chan *CMD, 64)
-	kv.lastResult = make(map[int]*GetReply, 0)
-	prefix := fmt.Sprintf("[%05d] ", me)
-	kv.log = log.New(os.Stdout, prefix, log.Ldate | log.Lshortfile | log.Lmicroseconds)
+func (kv *RaftKV) recoverFromSnapshot(snapshot []byte){
+	kv.mu.Lock()
+	defer kv.mu.Unlock()
+	if snapshot != nil{
+		r := bytes.NewBuffer(snapshot)
+		d := gob.NewDecoder(r)
+		d.Decode(&kv.commited)
+		kv.Log("recover from snapshot\n")
+		for k, v := range kv.commited{
+			kv.Log("recover key:%s value:%s\n", k, v.Value)
+		}
+	}
+}
 
-	kv.applyCh = make(chan raft.ApplyMsg, 128)
-	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
+func (kv *RaftKV) loadData(){
+	data := kv.rf.LoadSnapshot()
+	if data != nil{
+		r := bytes.NewBuffer(data)
+		d := gob.NewDecoder(r)
+		d.Decode(&kv.commited)
+	}
 	cmdArray , commitIndex:= kv.rf.GetLogs()
 	for _, cmd := range cmdArray{
 		op := cmd.(Op)
@@ -435,6 +459,83 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	for from, id := range kv.clientID{
 		kv.Log("record from:%d id:%d\n", from, id)
 	}
+}
+//
+// servers[] contains the ports of the set of
+// servers that will cooperate via Raft to
+// form the fault-tolerant key/value service.
+// me is the index of the current server in servers[].
+// the k/v server should store snapshots with persister.SaveSnapshot(),
+// and Raft should save its state (including log) with persister.SaveRaftState().
+// the k/v server should snapshot when Raft's saved state exceeds maxraftstate bytes,
+// in order to allow Raft to garbage-collect its log. if maxraftstate is -1,
+// you don't need to snapshot.
+// StartKVServer() must return quickly, so it should start goroutines
+// for any long-running work.
+//
+func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister, maxraftstate int) *RaftKV {
+	// call gob.Register on structures you want
+	// Go's RPC library to marshall/unmarshall.
+	gob.Register(Op{})
+
+	kv := new(RaftKV)
+	kv.me = me
+	kv.maxraftstate = maxraftstate
+
+	// Your initialization code here.
+	kv.commited = make(map[string]*Op, 0)
+	kv.pending = make(map[int]*PendingOp, 0)
+	kv.clientID = make(map[int]int, 0)
+	kv.cmdCh = make(chan *CMD, 64)
+	kv.lastResult = make(map[int]*GetReply, 0)
+	prefix := fmt.Sprintf("[%05d] ", me)
+	kv.log = log.New(os.Stdout, prefix, log.Ldate | log.Lshortfile | log.Lmicroseconds)
+
+	kv.Log("maxraftstate:%d\n", maxraftstate)	
+	kv.applyCh = make(chan raft.ApplyMsg, 128)
+	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
+	kv.persister = persister
+	kv.loadData()
+	/*
+	cmdArray , commitIndex:= kv.rf.GetLogs()
+	for _, cmd := range cmdArray{
+		op := cmd.(Op)
+		if op.ID > commitIndex{
+			continue
+		}
+		kv.clientID[op.From] = op.ID
+		if op.Cmd == "Put"{
+			kv.commited[op.Key] = &op
+		}
+		if op.Cmd == "Append"{
+			oldValue := ""
+			oldOp, ok := kv.commited[op.Key]
+			if ok{
+				oldValue = oldOp.Value
+				oldOp.Value = oldValue + op.Value
+				continue
+			}
+			kv.commited[op.Key] = &op
+		}
+		if op.Cmd == "Get"{
+			err := ErrNoKey
+			oldValue := ""
+			oldOp, ok := kv.commited[op.Key]
+			if ok{
+				err = OK
+				oldValue = oldOp.Value
+			}
+			kv.lastResult[op.From] = &GetReply{Err: Err(err), Value: oldValue, Seq: op.ID, From: kv.me}
+		}
+	}
+
+	for key, cmd := range kv.commited{
+		kv.Log("restore key:%s value:%s\n", key, cmd.Value)
+	}
+	for from, id := range kv.clientID{
+		kv.Log("record from:%d id:%d\n", from, id)
+	}
+	*/
 	go kv.poll()
 
 	return kv
