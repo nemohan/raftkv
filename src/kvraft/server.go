@@ -268,6 +268,7 @@ func (kv *RaftKV) handleAppend(op *Op, ch chan *Result){
 
 	newV := oldV + op.Value
 	kv.commited[op.Key].Value = newV
+	kv.commited[op.Key].ID = op.ID
 	kv.Log("append: arg:%s new:%s\n", op.String(), newV) 
 	if ch == nil{
 		return
@@ -423,6 +424,9 @@ func (kv *RaftKV) loadData(){
 		for k, v := range kv.commited{
 			kv.Log("reboot recover key:%s value:%s\n", k, v.Value)
 		}
+		for _, op := range kv.commited{
+			kv.clientID[op.From] = op.ID
+		}
 	}
 	cmdArray , commitIndex, cmdIndexs:= kv.rf.GetLogs()
 	for i, cmd := range cmdArray{
@@ -497,7 +501,7 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	prefix := fmt.Sprintf("[%05d] ", me)
 	kv.log = log.New(os.Stdout, prefix, log.Ldate | log.Lshortfile | log.Lmicroseconds)
 
-	kv.Log("maxraftstate:%d\n", maxraftstate)	
+	kv.Log("maxraftstate:%d\n", maxraftstate)
 	kv.applyCh = make(chan raft.ApplyMsg, 128)
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
 	kv.persister = persister
