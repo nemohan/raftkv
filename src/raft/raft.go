@@ -145,7 +145,7 @@ func (rf *Raft) createSnapshot(lastIncludedIndex int)[]byte{
 		logCopy[i] = cmd
 		indexs = append(indexs, i)
 	}
-	e.Encode(rf.commitIndex)
+	e.Encode(lastIncludedIndex)
 	//e.Encode(rf.log[rf.commitIndex].Term)
 	e.Encode(rf.log[lastIncludedIndex].Term)
 	e.Encode(logCopy)
@@ -244,18 +244,22 @@ func (rf *Raft) ReadPersist(data []byte) {
 }
 
 
-func (rf *Raft) LoadSnapshot()[]byte{
+func (rf *Raft) LoadSnapshot()([]byte, int){
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
 	data := rf.persister.ReadSnapshot()
 	if data == nil{
-		return data
+		return data, -1
 	}
 	logSize := readSize(data)
 	logData := make([]byte, logSize)
 	copy(logData, data[4:])
 
+	r := bytes.NewBuffer(logData)
+	d := gob.NewDecoder(r)
+	lastIndex := 0
+	d.Decode(&lastIndex)
 	/*
 	r := bytes.NewBuffer(data)
 	d := gob.NewDecoder(r)
@@ -268,7 +272,7 @@ func (rf *Raft) LoadSnapshot()[]byte{
 	*/
 
 	//stateSize := readSize(data[4 + logSize:])
-	return data[8 + logSize:]
+	return data[8 + logSize:], lastIndex
 }
 
 
@@ -400,9 +404,9 @@ func (rf *Raft) InstallSnapshot(stateData []byte, lastIndex int){
 }
 
 
-func (rf *Raft) GetLogs()([]interface{}, int){
+func (rf *Raft) GetLogs()([]interface{}, int, []int){
 	if len(rf.log) == 0{
-		return nil, -1
+		return nil, -1, nil
 	}
 	cmdArray := make([]interface{}, len(rf.log) -1)
 	indexs := make([]int, 0)
@@ -417,7 +421,7 @@ func (rf *Raft) GetLogs()([]interface{}, int){
 	for i, cmdID := range indexs{
 		cmdArray[i] = rf.log[cmdID].Cmd 
 	}
-	return cmdArray, rf.commitIndex
+	return cmdArray, rf.commitIndex, indexs
 }
 var seqSource uint32 = 0
 func getSeq()uint32{

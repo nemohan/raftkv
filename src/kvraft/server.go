@@ -415,16 +415,22 @@ func (kv *RaftKV) recoverFromSnapshot(snapshot []byte){
 }
 
 func (kv *RaftKV) loadData(){
-	data := kv.rf.LoadSnapshot()
+	data, lastIndex := kv.rf.LoadSnapshot()
 	if data != nil{
 		r := bytes.NewBuffer(data)
 		d := gob.NewDecoder(r)
 		d.Decode(&kv.commited)
+		for k, v := range kv.commited{
+			kv.Log("reboot recover key:%s value:%s\n", k, v.Value)
+		}
 	}
-	cmdArray , commitIndex:= kv.rf.GetLogs()
-	for _, cmd := range cmdArray{
+	cmdArray , commitIndex, cmdIndexs:= kv.rf.GetLogs()
+	for i, cmd := range cmdArray{
 		op := cmd.(Op)
-		if op.ID > commitIndex{
+		//BUG: op.ID <= lastIndex, op.ID comes from client, lastIndex is last index of the cmd in snapshot
+		//if op.ID > commitIndex || (lastIndex != -1 && op.ID <= lastIndex){
+		if op.ID > commitIndex || cmdIndexs[i] <= lastIndex{
+			kv.Log("ignore lastindex:%d commd:%v cmdIndex:%d\n", lastIndex, op, cmdIndexs[i])
 			continue
 		}
 		kv.clientID[op.From] = op.ID
