@@ -36,6 +36,10 @@ var clientID uint32
 func getID()uint32{
 	return atomic.AddUint32(&clientID, 1)
 }
+
+func (ck *Clerk) GetClientID() uint32{
+	return ck.id
+}
 //
 // fetch the current value for a key.
 // returns "" if the key does not exist.
@@ -95,6 +99,59 @@ func (ck *Clerk) Get(key string) string {
 	return value
 }
 
+
+func (ck *Clerk) putAppendToLeader(seq int, arg *PutAppendArgs)(bool){
+	if ck.leader == -1{
+		return false
+	}
+
+	num := 0
+	retry:
+	fmt.Printf("c:%d client  leader idx:%d put:%s \n", ck.id, ck.leader, arg.String())
+	reply := &PutAppendReply{}
+	ok := ck.servers[ck.leader].Call("RaftKV.PutAppend", arg, reply)
+	//The connection between me and kvserver
+	if !ok{
+		if num > 2{
+			return false
+		}
+		time.Sleep(time.Millisecond * 50)
+		num++
+		goto retry
+	}
+	//case 2: timeout
+	//TODO: should we try on another server node
+	if reply.Err == ErrTimeout{
+		return false
+	}
+	/*
+	if !reply.WrongLeader || reply.Err == ErrTimeout{
+		goto next
+	}
+	*/
+	//case 3: wrongleader
+	if reply.WrongLeader{
+		if reply.LeaderID == -1{
+			return false
+		}
+		if num >= 2{
+			return false
+		}
+		ck.leader = reply.LeaderID
+		num++
+		goto retry
+
+	}
+	fmt.Printf("c:%d client put:%s success leader index:%d \n", ck.id, arg.String(), ck.leader)
+	return true
+	/*
+	if reply.Err == OK{
+		fmt.Printf("c:%d client put:%s success leader index:%d \n", ck.id, arg.String(), ck.leader)
+		return reply.Value, true
+	}
+	*/
+
+}
 //
 // shared by Put and Append.
 //
@@ -109,8 +166,9 @@ func (ck *Clerk) PutAppend(key string, value string, op string) {
 	// You will have to modify this function.
 	seq := ck.seq
 	ck.seq++
-	num := 0
 
+	//arg := &PutAppendArgs{Key: key, Value: value, Op: op, Seq:seq, From:int(ck.id)}
+	num := 0
 	retry:
 	arg := &PutAppendArgs{Key: key, Value: value, Op: op, Seq:seq, From:int(ck.id)}
 	fmt.Printf("c:%d client  leader idx:%d put:%s \n", ck.id, ck.leader, arg.String())
@@ -132,6 +190,11 @@ func (ck *Clerk) PutAppend(key string, value string, op string) {
 			return
 		}
 	}
+	/*
+	if ck.putAppendToLeader(seq, arg){
+		return
+	}
+	*/
 	next:
 	for i, c := range ck.servers{
 		reply := &PutAppendReply{}
@@ -139,6 +202,19 @@ func (ck *Clerk) PutAppend(key string, value string, op string) {
 		if !ok || reply.WrongLeader || reply.Err == ErrTimeout{
 			continue
 		}
+		/*
+		if reply.WrongLeader{
+			if reply.LeaderID == -1{
+				continue
+			}
+			if ck.putAppendToLeader(seq, arg){ 
+				return
+			}
+		}
+		if reply.Err == ErrTimeout{
+			continue
+		}
+		*/
 		ck.leader = i
 		fmt.Printf("c:%d client put:%s ok leader index:%d\n", ck.id, arg.String(), ck.leader)
 		return

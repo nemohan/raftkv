@@ -30,7 +30,8 @@ type PutAppendReply struct {
 	WrongLeader bool
 	Err         Err
 	Seq         int
-	To	    int 
+	To	    int
+	LeaderID    int
 }
 
 type GetArgs struct {
@@ -46,4 +47,5 @@ type GetReply struct {
 	Value       string
 	Seq         int
 	From		int
+	LeaderID	int
 }

@@ -103,6 +103,7 @@ type Raft struct {
 	votedID    int
 	snapshot  *Snapshot 
 	isSnapshoted bool
+	leaderID int
 }
 
 type Voter struct{
@@ -201,7 +202,7 @@ func (rf *Raft) persist() {
 	}
 	*/
 	sort.Slice(indexs, func(i, j int)bool{ return indexs[i] < indexs[j]})
-	rf.logHandle.Printf("save:%v\n", indexs)
+	//rf.logHandle.Printf("save:%v\n", indexs)
 }
 
 //
@@ -418,6 +419,7 @@ func (rf *Raft) GetLogs()([]interface{}, int, []int){
 	}
 	sort.Slice(indexs, func(i, j int)bool{return indexs[i] < indexs[j]})
 
+	rf.logHandle.Printf("GetLog: index:%v\n", indexs)
 	for i, cmdID := range indexs{
 		cmdArray[i] = rf.log[cmdID].Cmd 
 	}
@@ -631,6 +633,7 @@ func (rf *Raft) AppendEntry(arg AppendEntryArg, reply *AppendEntryReply){
 	rf.electionTimeout = time.Now()
 	rf.voted = false
 	rf.votedID = invalidNodeID
+	rf.leaderID = arg.LeaderID
 	if arg.PrevLogIndex == invalidPrevLogIndex{
 		reply.OK = true
 		return
@@ -871,9 +874,13 @@ func (rf *Raft) prepareVote(id int, arg *RequestVoteArgs){
 		return
 	}
 
-	if !reply.VoteGranted || rf.lastVoteTerm != rf.currentTerm{
+
+	//BUG: we should test if arg.Term is less than rf.currentTerm
+	//The delayed vote reply from previous term my confuse us
+	if !reply.VoteGranted || rf.lastVoteTerm != rf.currentTerm || arg.Term < rf.currentTerm{
 		return
 	}
+	rf.logHandle.Printf("vote from node:%d\n", id)
 	rf.votedMap[rf.currentTerm]++
 	if rf.votedMap[rf.currentTerm] >= majority{
 		rf.state = stateLeader
@@ -1153,6 +1160,12 @@ func (rf *Raft) leaderCommit(){
 	}
 }
 
+func (rf *Raft)GetLeader()int{
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	return rf.leaderID
+}
+
 func (rf *Raft) isLeader(term int)bool{
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
@@ -1271,6 +1284,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.votedMap = make(map[int]int, 1)
 	rf.log[0] = &Command{ Index:0, Term: -1, Cmd: nil} //place holder
 	rf.cmdIndex = 1
+	rf.leaderID = -1
 	rf.logHandle = log.New(os.Stdout, fmt.Sprintf("[me:%03d] ", rf.me), log.Ltime | log.Lmicroseconds | log.Lshortfile)
 	rf.logHandle.Printf("me:%d timeout value:%d\n", rf.me, v)
 	for idx, _ := range rf.peers{
