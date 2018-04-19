@@ -8,10 +8,15 @@ import "labrpc"
 import "time"
 import "crypto/rand"
 import "math/big"
+import(
+	"sync/atomic"
+)
+
 
 type Clerk struct {
 	servers []*labrpc.ClientEnd
 	// Your data here.
+	seq uint32
 }
 
 func nrand() int64 {
@@ -28,10 +33,14 @@ func MakeClerk(servers []*labrpc.ClientEnd) *Clerk {
 	return ck
 }
 
+func (ck *Clerk) getSeq()uint32{
+	return atomic.AddUint32(&ck.seq, 1)
+}
 func (ck *Clerk) Query(num int) Config {
 	args := &QueryArgs{}
 	// Your code here.
 	args.Num = num
+	args.Seq = ck.getSeq()
 	for {
 		// try each known server.
 		for _, srv := range ck.servers {
@@ -49,7 +58,7 @@ func (ck *Clerk) Join(servers map[int][]string) {
 	args := &JoinArgs{}
 	// Your code here.
 	args.Servers = servers
-
+	args.Seq = ck.getSeq()
 	for {
 		// try each known server.
 		for _, srv := range ck.servers {
@@ -67,7 +76,7 @@ func (ck *Clerk) Leave(gids []int) {
 	args := &LeaveArgs{}
 	// Your code here.
 	args.GIDs = gids
-
+	args.Seq = ck.getSeq()
 	for {
 		// try each known server.
 		for _, srv := range ck.servers {

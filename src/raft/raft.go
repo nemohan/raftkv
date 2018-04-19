@@ -617,10 +617,10 @@ func (rf *Raft) RequestVote(args RequestVoteArgs, reply *RequestVoteReply) {
 func (rf *Raft) AppendEntry(arg AppendEntryArg, reply *AppendEntryReply){
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-	rf.logHandle.Printf("me:%d AppendEntryArg:%s entrys:%d\n", rf.me, arg.String(), len(arg.Entries))
+	rf.logHandle.Printf("me:%d AppendEntryArg:%s entrys:%d Entries:%v\n", rf.me, arg.String(), len(arg.Entries), arg.Entries)
 	/*
 	for _, e := range arg.Entries{
-		rf.logHandle.Printf("entry:%v\n", *e)
+		rf.logHandle.Printf("entry:%v\n", e)
 	}
 	*/
 	if arg.Term < rf.currentTerm{
@@ -783,6 +783,11 @@ func (rf *Raft) sendRequestVote(server int, args RequestVoteArgs, reply *Request
 }
 
 func (rf *Raft) sendAppendEntry(server int, arg AppendEntryArg, reply *AppendEntryReply) bool{
+	/*
+	for _, e := range arg.Entries{
+		rf.logHandle.Printf("==============to node:%d entry:%v\n", server, e)
+	}
+	*/
 	return rf.peers[server].Call("Raft.AppendEntry", arg, reply)
 }
 

@@ -33,44 +33,53 @@ type Config struct {
 
 const (
 	OK = "OK"
+	ErrTimeout = "timeout"
 )
 
 type Err string
 
 type JoinArgs struct {
 	Servers map[int][]string // new GID -> servers mappings
+	Seq uint32
 }
 
 type JoinReply struct {
 	WrongLeader bool
 	Err         Err
+	Seq	   uint32
 }
 
 type LeaveArgs struct {
 	GIDs []int
+	Seq uint32
 }
 
 type LeaveReply struct {
 	WrongLeader bool
 	Err         Err
+	Seq	   uint32 
 }
 
 type MoveArgs struct {
 	Shard int
 	GID   int
+	Seq  uint32
 }
 
 type MoveReply struct {
 	WrongLeader bool
 	Err         Err
+	Seq 	   uint32
 }
 
 type QueryArgs struct {
 	Num int // desired config number
+	Seq uint32
 }
 
 type QueryReply struct {
 	WrongLeader bool
 	Err         Err
 	Config      Config
+	Seq 	uint32
 }
