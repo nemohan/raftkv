@@ -32,8 +32,17 @@ type ShardMaster struct {
 	replyChan chan interface{} //assume only one request 
 	commited map[int]*Op
 	pendingList map[uint32] *PendingOP
+	groupNum int
+	freeGroup map[int][]string
+	//groupTable map[int]int //key is gid, value is shard number
+	groupTable []*GroupInfo
 }
 
+type GroupInfo struct{
+	gid int
+	weight int
+	isFree bool
+}
 const Debug =1
 
 type Op struct {
@@ -46,6 +55,8 @@ type Op struct {
 	Leave *LeaveArgs
 	Move *MoveArgs
 	From int
+	GID  int
+	Server string
 }
 
 const (
@@ -154,8 +165,16 @@ func (sm *ShardMaster) Join(args *JoinArgs, reply *JoinReply) {
 		From: 0,
 		Seq: args.Seq,
 		Join: args,
+		//GID: args.
 	}
 
+	//for debug
+	for i, s := range args.Servers{
+		op.GID = i
+		op.Server = fmt.Sprintf("%s:%s:%s", s[0], s[1], s[2])
+	}
+
+	//for debug end
 	//TODO: can't use interface in op
 	/*
 	copyArg := JoinArgs{Seq: args.Seq, Servers: make(map[int][]string, 0)}
@@ -172,23 +191,112 @@ func (sm *ShardMaster) Join(args *JoinArgs, reply *JoinReply) {
 	reply.WrongLeader = v.WrongLeader
 }
 
-func (sm *ShardMaster) rebalance( /*newShards []int*/){
-	gids := make([]int, 0)
-	shards := &(sm.configs[sm.currentConfigNum].Shards)
-	for i := 0; i < sm.shardNum; i++{
-		gids = append(gids, shards[i])
-	}
+func (sm *ShardMaster) getMinAndMax()(*GroupInfo, *GroupInfo){
+		min := 10
+		max := -1
+		maxGid := 0
+		minGid := 0
+		weight := make(map[int]int)
 
-	for i := sm.shardNum; i < NShards; i++{
-		if sm.shardNum == 0{
-			shards[i] = 0
-			continue
+	lastCfg := &(sm.configs[sm.currentConfigNum])
+		for _, g := range lastCfg.Shards{
+			weight[g]++
 		}
-		shards[i] = gids[i%sm.shardNum]	
-	}
-	sm.Log("rebalance: shards:%v\n", shards)
+		for g, w := range weight{
+			if w < min{
+				min = w
+				minGid = g
+			}
+			if w > max{
+				max = w
+				maxGid = g
+			}
+		}
+		return &GroupInfo{gid: minGid, weight: min}, &GroupInfo{gid: maxGid, weight: max}
 }
 
+func (sm *ShardMaster) isBalance(isLeave bool)bool{
+	min := 10
+	max := -1
+	//Choose the group which responsible shards
+	//because the group number may be greater than shard number
+	for _, g := range sm.groupTable{
+		if  isLeave && g.isFree{
+			continue
+		}
+		if g.weight <= min{
+			min = g.weight
+		}
+		if g.weight >= max{
+			max = g.weight
+		}
+	}
+	if min == max || max -min == 1{
+		return true
+	}
+	return false
+}
+
+func (sm *ShardMaster) rebalance(isLeave bool, leaveGrp *GroupInfo){
+	//No more shard to assign to new group
+	if sm.groupNum > NShards && !isLeave{
+		sm.Log("need not to rebalance. groupNum:%d\n", sm.groupNum)
+		return
+	}
+	lastCfg := &(sm.configs[sm.currentConfigNum])
+	sm.Log("rebalance_before:%v leaveGrp:%v isLeave:%v \n", lastCfg.Shards, leaveGrp, isLeave)
+
+	addHeader := false
+	if !isLeave && sm.groupNum == 1{
+		sm.groupTable = append(sm.groupTable, &GroupInfo{gid: 0, weight:20})
+		addHeader = true
+	}
+	if isLeave && sm.groupNum == 0{
+		sm.groupTable = append(sm.groupTable, &GroupInfo{gid:0, weight:10})
+		addHeader = true
+	}
+
+	for i, g := range sm.groupTable{
+		sm.Log("rebalance_n:i:%d %v\n", i, g)
+	}
+	for !sm.isBalance(isLeave){
+		min := 10
+		max := -1
+		minIdx := 0
+	        maxIdx := 0
+		for i, g := range sm.groupTable{
+			weight := g.weight
+			if weight <= min{
+				min = weight
+				minIdx = i
+			}
+			if weight >= max{
+				max = weight
+				maxIdx = i
+			}
+		}
+
+		minGrp := sm.groupTable[minIdx]
+		maxGrp := sm.groupTable[maxIdx]
+
+		for s, gid := range lastCfg.Shards{
+			if gid != maxGrp.gid {
+				continue
+			}
+			lastCfg.Shards[s] = minGrp.gid
+			minGrp.isFree = false
+			minGrp.weight++
+			maxGrp.weight--
+			sm.Log("weight:%d grp:%d for shard:%d\n", minGrp.weight, minGrp.gid, s)
+			break
+		}
+	}
+	if addHeader{
+		size := len(sm.groupTable)
+		sm.groupTable = append(sm.groupTable[:size-1], sm.groupTable[size:]...)
+	}
+	sm.Log("rebalance_after:%v leaveGrp:%v\n", lastCfg.Shards, leaveGrp)
+}
 
 func (sm *ShardMaster) Leave(args *LeaveArgs, reply *LeaveReply) {
 	// Your code here.
@@ -256,9 +364,10 @@ func (sm *ShardMaster) handleJoin( op *Op)interface{}{
 		gid = k
 	}
 
-	for _, oldGid := range lastConfig.Shards{
-		if oldGid == gid{
-			return &JoinReply{Err: OK, WrongLeader: false}
+	//check repeat
+	for oldGid, _ := range lastConfig.Groups{
+		if gid == oldGid{
+			return &JoinReply{Err:OK}
 		}
 	}
 	sm.currentConfigNum++
@@ -267,13 +376,12 @@ func (sm *ShardMaster) handleJoin( op *Op)interface{}{
 		//Shards:[NShards]int{gid}, 		//int
 		//Groups:args.Servers, //map[int][]string
 	}
-
-	for i := 0; i < sm.shardNum; i++{
-		config.Shards[i] = lastConfig.Shards[i]
+	sm.groupNum++
+	for i, g := range lastConfig.Shards{
+		config.Shards[i] = g
 	}
-	config.Shards[sm.shardNum] = gid
-	sm.shardNum++
 	config.Groups = make(map[int][]string, 1)
+	sm.groupTable = append(sm.groupTable, &GroupInfo{gid:gid, weight:0, isFree: true})
 	for k, v := range lastConfig.Groups{
 		config.Groups[k] = v
 	}
@@ -281,20 +389,28 @@ func (sm *ShardMaster) handleJoin( op *Op)interface{}{
 	//free shard
 	sm.Log(" config:%d last shards:%v last groups:%v\n", oldConfigNum, lastConfig.Shards, lastConfig.Groups)
 	sm.configs = append(sm.configs, config)
-	sm.rebalance()
+	sm.rebalance(false, &GroupInfo{gid:gid})
 	newCfg := &sm.configs[sm.currentConfigNum]
-	sm.Log("config_after_join num:%d shards:%v groups:%v\n", sm.currentConfigNum, newCfg.Shards, newCfg.Groups)
+	sm.Log("config_after_join num:%d shards:%v groups:%v grp num:%d\n", sm.currentConfigNum, newCfg.Shards, newCfg.Groups, sm.groupNum)
 	return &JoinReply{Err: OK, WrongLeader: false}
 }
 
 
 func (sm *ShardMaster) isGIDValid(args *LeaveArgs)bool{
-	lastConfig := sm.configs[sm.currentConfigNum]
-	for i := 0; i < sm.shardNum; i++{
+	curCfg := sm.configs[sm.currentConfigNum]
+	/*
+	for i := 0; i < sm.groupNum; i++{
 		for _, gid := range args.GIDs{
+			/*
 			if lastConfig.Shards[i] == gid{
 				return true
 			}
+		}
+	}
+	*/
+	for _, gid := range args.GIDs{
+		if _, ok := curCfg.Groups[gid]; ok{
+			return true
 		}
 	}
 	return false
@@ -307,6 +423,7 @@ func (sm *ShardMaster) handleLeave(op *Op)interface{}{
 	sm.Log("handle_leave: leave args:%v\n", args)
 
 	if !sm.isGIDValid(args){
+		sm.Log("handle_leave not find:%v  config:%d\n", args, sm.currentConfigNum)
 		return &LeaveReply{
 			Seq: op.Seq,
 			WrongLeader:false,
@@ -319,29 +436,46 @@ func (sm *ShardMaster) handleLeave(op *Op)interface{}{
 		}
 	lastConfig := sm.configs[oldConfigNum]
 
-	newShardNum := sm.shardNum
-
-
-	j := 0
-	for i := 0; i < newShardNum; i++{
-		oldGid := lastConfig.Shards[i]
-		for _, gid := range args.GIDs{
-			if gid == oldGid{
+	for gid, grp := range lastConfig.Groups{
+		for _, leaveGid := range args.GIDs{
+			if gid == leaveGid{
+				sm.groupNum--
 				goto next
 			}
 		}
-		newCfg.Shards[j] = oldGid
-		j++
-		newCfg.Groups[oldGid] = lastConfig.Groups[oldGid]
-		sm.shardNum--
+		newCfg.Groups[gid] = grp
 		next:
 	}
 
+	//TODO: assume there is only leave gid
+	weight := 0
+	leaveGid := args.GIDs[0]
+	for i, g := range lastConfig.Shards{
+		newCfg.Shards[i] = g
+		if g == leaveGid{
+			weight++
+		}
+	}
+
+	leaveIdx := 0
+	for i, g := range sm.groupTable{
+		if g.gid == leaveGid{
+			//The move operation rebalanced the shard 
+			if !sm.isBalance(true){
+				g.weight *= 2
+			}else{
+				g.weight += weight *2
+			}
+			leaveIdx = i
+			break
+		}
+	}
 	sm.configs = append(sm.configs, newCfg)
 	sm.Log("config_before_leave: config:%d shards:%v groups:%v\n", oldConfigNum, lastConfig.Shards, lastConfig.Groups)
-	sm.rebalance()
+	sm.rebalance(true, &GroupInfo{gid: args.GIDs[0]})
+	sm.groupTable = append(sm.groupTable[:leaveIdx], sm.groupTable[leaveIdx+1:]...)
 	curCfg := &sm.configs[sm.currentConfigNum]
-	sm.Log("config_after_leave: config:%d shards:%v group:%v\n", sm.currentConfigNum, curCfg.Shards, curCfg.Groups)
+	sm.Log("config_after_leave: config:%d shards:%v group:%v group num:%d\n", sm.currentConfigNum, curCfg.Shards, curCfg.Groups, sm.groupNum)
 
 	return &LeaveReply{
 		Seq: op.Seq,
@@ -390,11 +524,28 @@ func (sm *ShardMaster) handleMove(op *Op)interface{}{
 	//before move:
 	//shard 1 -> group 1
 	//shard 2 -> group 2
+	var dstGrp *GroupInfo
+	for _, g := range sm.groupTable{
+		if g.gid == arg.GID{
+			dstGrp = g
+			break
+		}
+	}
 
-	//now move 1 to 2. shard 1 -> group 2, shard 2-> group 2 
+	//now move 1 to 2. shard 1 -> group 2, shard 2-> group 2
 	for i, gid := range lastCfg.Shards{
 		if i == arg.Shard{
+			srcGid := lastCfg.Shards[i]
 			newCfg.Shards[i] = arg.GID
+			//sm.freeGroup[arg.GID] = lastCfg.Groups[gid]
+			newCfg.Groups[gid] = lastCfg.Groups[gid]
+			dstGrp.weight++
+			for _, g := range sm.groupTable{
+				if g.gid == srcGid{
+					g.weight--
+					break
+				}
+			}
 			continue
 		}
 		newCfg.Shards[i] = gid
@@ -403,7 +554,6 @@ func (sm *ShardMaster) handleMove(op *Op)interface{}{
 	sm.configs = append(sm.configs, newCfg)
 
 	sm.Log("config_move_before: num:%d shards:%v config:%v\n", oldConfigNum, lastCfg.Shards, lastCfg.Groups)
-	//sm.rebalance()
 	sm.Log("config_move_after: num:%d shards:%v config:%v\n", sm.currentConfigNum,
 		sm.configs[sm.currentConfigNum].Shards, sm.configs[sm.currentConfigNum].Groups)
 	return &MoveReply{Err:OK, Seq: op.Seq}
@@ -492,6 +642,9 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister)
 	sm.lastRequestID = make(map[int]int)
 	//sm.Log("reboot\n")
 	//data := persister.ReadRaftState()
+	sm.freeGroup = make(map[int][]string)
+	//sm.groupTable = make(map[int]int)
+	sm.groupTable = make([]*GroupInfo, 0)
 	go sm.backgroudTask()
 	sm.recoverFromDisk()
 	return sm
