@@ -13,10 +13,12 @@ import(
 )
 
 
+var ClientID uint32
 type Clerk struct {
 	servers []*labrpc.ClientEnd
 	// Your data here.
 	seq uint32
+	id uint32
 }
 
 func nrand() int64 {
@@ -30,17 +32,24 @@ func MakeClerk(servers []*labrpc.ClientEnd) *Clerk {
 	ck := new(Clerk)
 	ck.servers = servers
 	// Your code here.
+	ck.id = getID()
 	return ck
 }
 
 func (ck *Clerk) getSeq()uint32{
 	return atomic.AddUint32(&ck.seq, 1)
 }
+
+func getID() uint32{
+	return atomic.AddUint32(&ClientID, 1)
+}
+
 func (ck *Clerk) Query(num int) Config {
 	args := &QueryArgs{}
 	// Your code here.
 	args.Num = num
 	args.Seq = ck.getSeq()
+	args.From = ck.id
 	for {
 		// try each known server.
 		for _, srv := range ck.servers {
@@ -59,12 +68,16 @@ func (ck *Clerk) Join(servers map[int][]string) {
 	// Your code here.
 	args.Servers = servers
 	args.Seq = ck.getSeq()
+	args.From = ck.id
 	for {
 		// try each known server.
 		for _, srv := range ck.servers {
 			var reply JoinReply
 			ok := srv.Call("ShardMaster.Join", args, &reply)
 			if ok && reply.WrongLeader == false {
+				if reply.Err == ErrTimeout{
+					continue
+				}
 				return
 			}
 		}
@@ -77,12 +90,16 @@ func (ck *Clerk) Leave(gids []int) {
 	// Your code here.
 	args.GIDs = gids
 	args.Seq = ck.getSeq()
+	args.From = ck.id
 	for {
 		// try each known server.
 		for _, srv := range ck.servers {
 			var reply LeaveReply
 			ok := srv.Call("ShardMaster.Leave", args, &reply)
 			if ok && reply.WrongLeader == false {
+				if reply.Err == ErrTimeout{
+					continue
+				}
 				return
 			}
 		}
@@ -95,7 +112,7 @@ func (ck *Clerk) Move(shard int, gid int) {
 	// Your code here.
 	args.Shard = shard
 	args.GID = gid
-
+	args.From = ck.id
 	for {
 		// try each known server.
 		for _, srv := range ck.servers {

@@ -10,11 +10,17 @@ import "fmt"
 import "os"
 import(
 	"time"
+	"strconv"
 )
 
 type PendingOP struct{
 	op *Op
 	replyChan chan interface{}
+}
+
+type PendingTable struct{
+	pendingList map[uint32] *PendingOP
+	id uint32
 }
 type ShardMaster struct {
 	mu      sync.Mutex
@@ -31,7 +37,8 @@ type ShardMaster struct {
 	lastRequestID map[int]int
 	replyChan chan interface{} //assume only one request 
 	commited map[int]*Op
-	pendingList map[uint32] *PendingOP
+	//pendingList map[uint32] *PendingOP
+	pendingTables map[uint32] *PendingTable
 	groupNum int
 	freeGroup map[int][]string
 	//groupTable map[int]int //key is gid, value is shard number
@@ -54,9 +61,10 @@ type Op struct {
 	Query *QueryArgs
 	Leave *LeaveArgs
 	Move *MoveArgs
-	From int
+	From uint32
 	GID  int
 	Server string
+	Info string
 }
 
 const (
@@ -76,9 +84,15 @@ func (sm *ShardMaster) addPending(op *Op) chan interface{}{
 	defer sm.mu.Unlock()
 	sm.Log("add pending req:%v\n", op)
 	replyChan := make(chan interface{}, 1)
-	sm.pendingList[op.Seq] = &PendingOP{
+
+	pendingTable, ok := sm.pendingTables[op.From]
+	if !ok{
+		pendingTable = &PendingTable{pendingList: make(map[uint32]*PendingOP), id: op.From}
+		sm.pendingTables[op.From] = pendingTable
+	}
+	pendingTable.pendingList[op.Seq] = &PendingOP{
 		op: op,
-		replyChan : replyChan, 
+		replyChan : replyChan,
 	}
 
 	return replyChan
@@ -86,11 +100,15 @@ func (sm *ShardMaster) addPending(op *Op) chan interface{}{
 func (sm *ShardMaster) removePending(op *Op) chan interface{}{
 	sm.mu.Lock()
 	defer sm.mu.Unlock()
-	v, ok := sm.pendingList[op.Seq]
+	pendingTable, ok := sm.pendingTables[op.From]
 	if !ok{
 		return nil
 	}
-	delete(sm.pendingList, op.Seq)
+	v, ok := pendingTable.pendingList[op.Seq]
+	if !ok{
+		return nil
+	}
+	delete(pendingTable.pendingList, op.Seq)
 	return v.replyChan
 }
 
@@ -162,7 +180,7 @@ func (sm *ShardMaster) Join(args *JoinArgs, reply *JoinReply) {
 	//TODO: this code is mesteries
 	op := &Op{
 		CMD : cmdJoin,
-		From: 0,
+		From: args.From,
 		Seq: args.Seq,
 		Join: args,
 		//GID: args.
@@ -313,16 +331,24 @@ func (sm *ShardMaster) Leave(args *LeaveArgs, reply *LeaveReply) {
 	sm.Log("leave args:%v\n", args)
 	op := &Op{
 		CMD : cmdLeave,
-		From: 0,
+		From: args.From,
 		//Arg: args,
 		Leave: args,
 		Seq: args.Seq,
+	}
+	for _, g := range args.GIDs{
+		op.Server += strconv.Itoa(g)
+		op.Server += ":"
 	}
 	r := sm.performRequest( op)
 	v := r.(*LeaveReply)
 	reply.Err = v.Err
 	reply.WrongLeader = v.WrongLeader
 	reply.Seq = v.Seq
+	sm.Log("leave reply:%v\n", reply)
+	if reply.Err == ErrTimeout{
+		sm.Log("timeout args:%v\n", args)
+	}
 }
 
 func (sm *ShardMaster) Move(args *MoveArgs, reply *MoveReply) {
@@ -330,7 +356,7 @@ func (sm *ShardMaster) Move(args *MoveArgs, reply *MoveReply) {
 	sm.Log("move args:%v\n", args)
 	op := &Op{
 		CMD : cmdMove,
-		From: 0,
+		From: args.From,
 		Move: args,
 		Seq: args.Seq,
 	}
@@ -346,7 +372,7 @@ func (sm *ShardMaster) Query(args *QueryArgs, reply *QueryReply) {
 	sm.Log("query args:%v num:%d seq:%d\n", args, args.Num, args.Seq)
 	op := &Op{
 		CMD : cmdQuery,
-		From: 0,
+		From: args.From,
 		//Arg: args,
 		Query: args,
 		Seq: args.Seq,
@@ -386,7 +412,6 @@ func (sm *ShardMaster) handleJoin( op *Op)interface{}{
 		return &JoinReply{Err: OK}
 	}
 	sm.currentConfigNum++
-	//sm.groupNum += memberNum
 	config := Config{
 		Num:  sm.currentConfigNum,		//int
 		//Shards:[NShards]int{gid}, 		//int
@@ -400,19 +425,27 @@ func (sm *ShardMaster) handleJoin( op *Op)interface{}{
 		config.Groups[k] = v
 	}
 
-	//config.Groups[gid] = args.Servers[gid]
 	//free shard
 	sm.Log(" config:%d last shards:%v last groups:%v\n", oldConfigNum, lastConfig.Shards, lastConfig.Groups)
 	sm.configs = append(sm.configs, config)
 
 	//TODO: Fix this. remove the loop 
-	for k, v := range servers{
+	max := -1
+	num := len(servers)
+	for num > 0{
+		for k, _ := range servers{
+			if k > max{
+				max = k
+			}
+		}
 		sm.groupNum++
-		sm.groupTable = append(sm.groupTable, &GroupInfo{gid:k, weight:0, isFree: true})
-		config.Groups[k] = v
-		sm.rebalance(false, &GroupInfo{gid: k})
+		sm.groupTable = append(sm.groupTable, &GroupInfo{gid:max, weight:0, isFree: true})
+		config.Groups[max] = servers[max]
+		sm.rebalance(false, &GroupInfo{gid: max})
+		num--
+		delete(servers, max)
+		max = -1
 	}
-	//sm.rebalance(false, &GroupInfo{gid:gid})
 	newCfg := &sm.configs[sm.currentConfigNum]
 	sm.Log("config_after_join num:%d shards:%v groups:%v grp num:%d\n", sm.currentConfigNum, newCfg.Shards, newCfg.Groups, sm.groupNum)
 	return &JoinReply{Err: OK, WrongLeader: false}
@@ -568,7 +601,6 @@ func (sm *ShardMaster) handleMove(op *Op)interface{}{
 		if i == arg.Shard{
 			srcGid := lastCfg.Shards[i]
 			newCfg.Shards[i] = arg.GID
-			//sm.freeGroup[arg.GID] = lastCfg.Groups[gid]
 			newCfg.Groups[gid] = lastCfg.Groups[gid]
 			dstGrp.weight++
 			for _, g := range sm.groupTable{
@@ -667,7 +699,8 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister)
 	// Your code here.
 	//sm.configs[0].Groups[0] = nil 
 	sm.replyChan = make(chan interface{})
-	sm.pendingList = make(map[uint32] *PendingOP, 0)
+	//sm.pendingList = make(map[uint32] *PendingOP, 0)
+	sm.pendingTables = make(map[uint32] *PendingTable, 1)
 	sm.lastRequestID = make(map[int]int)
 	//sm.Log("reboot\n")
 	//data := persister.ReadRaftState()

@@ -41,6 +41,7 @@ type Err string
 type JoinArgs struct {
 	Servers map[int][]string // new GID -> servers mappings
 	Seq uint32
+	From uint32
 }
 
 type JoinReply struct {
@@ -52,6 +53,7 @@ type JoinReply struct {
 type LeaveArgs struct {
 	GIDs []int
 	Seq uint32
+	From uint32
 }
 
 type LeaveReply struct {
@@ -64,6 +66,7 @@ type MoveArgs struct {
 	Shard int
 	GID   int
 	Seq  uint32
+	From uint32
 }
 
 type MoveReply struct {
@@ -75,6 +78,7 @@ type MoveReply struct {
 type QueryArgs struct {
 	Num int // desired config number
 	Seq uint32
+	From uint32
 }
 
 type QueryReply struct {
