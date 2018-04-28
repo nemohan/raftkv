@@ -56,6 +56,9 @@ func (ck *Clerk) Query(num int) Config {
 			var reply QueryReply
 			ok := srv.Call("ShardMaster.Query", args, &reply)
 			if ok && reply.WrongLeader == false {
+				if reply.Err == ErrTimeout{
+					continue
+				}
 				return reply.Config
 			}
 		}

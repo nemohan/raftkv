@@ -505,6 +505,10 @@ func (rf *Raft) updateTerm(term int){
 	if term < rf.currentTerm{
 		return
 	}
+	//FIX:BUG 1
+	if term == rf.currentTerm && rf.state == stateLeader{
+		return
+	}
 	rf.currentTerm = term
 	//TODO: is this persist necessary
 	rf.persist()
@@ -536,7 +540,6 @@ func (rf *Raft) RequestSnapshot(args SnapshotArg, reply *SnapshotReply){
 	reply.Term = rf.currentTerm
 	rf.electionTimeout = time.Now()
 	rf.doBackgroundSnapshot()
-	
 }
 
 func (rf *Raft) doBackgroundSnapshot(){
@@ -591,6 +594,14 @@ func (rf *Raft) RequestVote(args RequestVoteArgs, reply *RequestVoteReply) {
 	if rf.voted && rf.votedTerm >= args.Term{
 		reply.VoteGranted = false
 		rf.logHandle.Printf("me:%d i'm already voted\n", rf.me)
+		return
+	}
+	//FIX: 1) node B becomes leader in term 3  (There is 3 nodes) 
+	//     2) requestVoteRPC from node A arrive, and A in term 3 too
+	//     3) node vote A. wrong !!!!
+	if rf.state == stateLeader && rf.currentTerm == args.Term{
+		reply.VoteGranted = false
+		rf.logHandle.Printf("i'm already leader in term:%d\n", rf.currentTerm)
 		return
 	}
 	/************Replace 2018/4/9 end ***************/
